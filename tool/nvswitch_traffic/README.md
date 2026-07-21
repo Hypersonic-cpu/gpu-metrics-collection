@@ -44,6 +44,26 @@ nvswitch_traffic -d 500 --csv > sw.csv & P=$!; run_workload; kill $P  # 后台�
 4.41       sw1      110.5     110.5     221.0       ← 负载进来
 ```
 
+## 配置组 `<name>.conf`（`profile.sh --backend nvswitch` 用）
+上层 `tool/profile.sh` 可把本工具当**独立后端**编排（`--backend nvswitch`，起停 + marks + wrap/attach + 出图，输出统一进 `runs/<id>/`）——
+**集成用法/命令/输出见项目 [`README.md`](../../README.md) ② 段**；这里只讲本工具专属的**配置组**。
+
+**配置组 = `tool/nvswitch_traffic/<name>.conf`**（`key=value`，`#` 注释；`profile.sh --sw-config <name>` 读它）——
+角色对应 DCGM 的字段组 `tool/dcgmi/<name>.txt`。只放**采什么**（`-l/-e/-i/-r`）；**采多快**（`-d`）与起停由 `profile.sh` 的
+`--interval-ms` + wrap/attach 统一控制，不在 conf 里。加新组 = 丢个 `.conf`，无需改代码。
+
+| key | 对应参数 | 取值 | 默认 |
+|---|---|---|---|
+| `level` | `-l` | `total`(全 fabric 一行) / `switch`(每台物理 switch) / `port`(每端口, 256 行/拍) | `switch` |
+| `fields` | `-e` | `rx,tx,total` 任意组合 | `rx,tx,total` |
+| `switches` | `-i` | `all` 或 `0,1,2,3` | `all` |
+| `raw` | `-r` | `0`=速率 GB/s，`1`=每拍原始累计增量 Mibits | `0` |
+
+现成组：`sw_switch`(默认，每台 switch) · `sw_total`(全 fabric 一行，最省) · `sw_port`(每端口，看热点，数据量大)。
+
+> **CSV 里 `switch`/`port` 列在聚合粒度填 `-1`（= N/A，不是出错）**：`total` 两列都 -1（整机一行）、`switch` 的 `port` 为 -1、
+> 只有 `port` 粒度两列才都有真值。想看每台 switch 的编号用默认 `sw_switch`；`sw_total` 本就是把 4 台汇成一行。
+
 ## 输出口径（重要）
 - **实体**：`switch` = 一颗**物理 NVSwitch 芯片**（本机 **4 颗** = PCIe 设备 05/06/07/08）；`port` = 该芯片上**一根 NVLink 端口**
   （每颗 64 端口，共 256）。`0..3` 按 UUID 排序稳定编号（注：`dcgmi discovery -l` 报"12 NvSwitch"是逻辑口径）。

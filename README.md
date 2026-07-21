@@ -37,7 +37,8 @@ tool/
 nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
 ```
 
-当前两类工具**分别启动**（合并成一键脚本的计划见下 TODO）。各自的完整用法见对应 tool README，最小跑通如下：
+两类工具都由 `tool/profile.sh` 编排（`--backend dcgm|nvswitch` 选路，**各自独立采集、一个 run 一个后端**，不合并）；
+nvswitch 也可脱离 profile.sh 直接跑（见 ②）。各自的完整用法见对应 tool README，最小跑通如下：
 
 ### ① DCGM 采集（GPU 侧 metric）—— 入口 `tool/profile.sh`
 `profile.sh` 编排整条流水线：起 `dcgmi dmon` + 打墙钟戳 + 记 marks，wrap/attach 两模式，输出统一进 `runs/<id>/`。
@@ -52,46 +53,61 @@ tool/profile.sh --gpus 4,5 --fields pass1_core --interval-ms 1000 --duration 60
 
 # 解析 + 出图（RUN=$(ls -dt runs/*/ | head -1) 取最新）
 python3 tool/metrics.py parse runs/<run_id>  # → metrics.csv + 控制台速览（宿主机, 纯 stdlib）
-docker run --rm -v "$PWD":/work -w /work nvcr.io/nvidia/pytorch:25.12-py3 \
-  python tool/metrics.py plot runs/<run_id>  # → plots/trace.png（容器）
+docker run --rm --user "$(id -u):$(id -g)" -e MPLCONFIGDIR=/tmp/mpl \
+  -v "$PWD":/work -w /work nvcr.io/nvidia/pytorch:25.12-py3 \
+  python tool/metrics.py plot runs/<run_id>  # → plots/trace.png（容器；--user 让图归当前用户）
 ```
 
 `profile.sh` 参数：
 
 | 参数 | 含义 | 默认 / 说明 |
 |---|---|---|
-| `--gpus` | 采哪几张卡（**物理卡号**）| 必填，如 `4,5` |
-| `--fields` | 字段组名（读 `tool/dcgmi/<name>.txt`）| `pass1_core` |
+| `--backend` | 采集后端 | `dcgm`（GPU 侧）/ `nvswitch`（过交换机流量）；**两者独立、一个 run 一个后端** |
+| `--gpus` | 采哪几张卡（**物理卡号**）| dcgm **必填**，如 `4,5`；nvswitch 忽略 |
+| `--fields` | dcgm 字段组名（读 `tool/dcgmi/<name>.txt`）| `pass1_core` |
+| `--sw-config` | nvswitch 配置组名（读 `tool/nvswitch_traffic/<name>.conf`）| `sw_switch` |
 | `--interval-ms` | 采样间隔 ms | `1000`；**下限 100**（先 1000 smoke 再 100 正式）|
 | `--duration N` | attach 采 N 秒窗口 | 与 `-- <命令>`（wrap）二选一 |
 | `--lead N` / `--lag N` | wrap：命令前空采基线 / 命令后续采等流量回落 | `2` / `3` 秒（`--lag 0` 关）|
 | `--out DIR` | 输出根目录 | `runs/` |
 
-输出 `runs/<id>/`：`dcgm_raw.log`(dmon 原样+每行 epoch) · `marks.txt`(关键时刻 epoch) · `workload.log` ·
+输出 `runs/<id>/`（dcgm 后端）：`dcgm_raw.log`(dmon 原样+每行 epoch) · `marks.txt`(关键时刻 epoch) · `workload.log` ·
 `metrics.csv`(长表 `epoch,t_rel,gpu,short,metric,value`) · `plots/trace.png` · `run_meta.json`。
+nvswitch 后端见下 ②。
 
 > `dcgmi dmon` 命令本身怎么用（`-e/-i/-d/-c` 参数、字段组文件、输出短名、warmup）→ **[`tool/dcgmi/README.md`](tool/dcgmi/README.md)**；
 > 字段语义/选字段/权限 → `docs/metrics_reference.md`。
 
 ### ② nvswitch_traffic（过交换机的 NVLink 流量）
 ```bash
-cd tool/nvswitch_traffic && make             # 一次编译，产出 ./nvswitch_traffic
-./nvswitch_traffic                           # 每 1s 打印每台 switch 的 rx/tx/total GB/s
-./nvswitch_traffic -d 500 --csv > sw.csv & P=$!; run_workload; kill $P   # 脚本采一段窗口
+cd tool/nvswitch_traffic && make             # 一次编译，产出 ./nvswitch_traffic（profile.sh 也用它）
+./nvswitch_traffic                           # 直接跑：每 1s 打印每台 switch 的 rx/tx/total GB/s
 ```
-完整参数、CSV 采集、口径说明 → **[`tool/nvswitch_traffic/README.md`](tool/nvswitch_traffic/README.md)**。
+也可**走同一套 `profile.sh` 流水线**（`--backend nvswitch`，独立于 dcgm；起停 + marks + 出图统一进 `runs/<id>/`）：
+```bash
+# wrap：拉起被测命令 → 自动起停 nvswitch 采集（配置组 sw_switch = 每台 switch 的 rx/tx/total）
+tool/profile.sh --backend nvswitch --sw-config sw_switch --interval-ms 100 -- <被测命令>
+# attach：只采一个窗口
+tool/profile.sh --backend nvswitch --sw-config sw_total --interval-ms 200 --duration 60
+# 解析 + 出图（parse 宿主机；plot 进容器，→ plots/nvswitch_trace.png）
+python3 tool/metrics.py parse runs/<run_id>
+docker run --rm --user "$(id -u):$(id -g)" -e MPLCONFIGDIR=/tmp/mpl \
+  -v "$PWD":/work -w /work nvcr.io/nvidia/pytorch:25.12-py3 \
+  python tool/metrics.py plot runs/<run_id>
+```
+输出 `runs/<id>/`（nvswitch 后端）：`nvswitch.csv`(自带 epoch 的规范数据) · `nvswitch.err` · `marks.txt` ·
+`run_meta.json` · `plots/nvswitch_trace.png`。完整参数、配置组 `<name>.conf`、口径说明 →
+**[`tool/nvswitch_traffic/README.md`](tool/nvswitch_traffic/README.md)**。
 
 ---
 
-## TODO：一键启动脚本（待实现）
+## TODO：同时双后端采集（可选，未定）
 
-目标：一条命令**同时**起两类采集、共用同一 `runs/<id>/` 与时间窗（epoch + marks 对齐），跑完统一解析出图。
-设计意图（详见 `PLAN.md`「工具架构」§1.2）：给 `profile.sh` 加后端分派，例如
-```bash
-tool/profile.sh --backend dcgm,nvswitch --gpus 4,5 --interval-ms 100 -- <被测命令>
-# dcgm 起 dcgmi dmon → dcgm_raw.log；nvswitch 起 nvswitch_traffic → nvswitch.csv；同一 marks 对齐
-```
-**当前**：`nvswitch_traffic` 已可独立/脚本调用，先手动并用即可；等后端分派做好，再把上面「①②」两段 quick start **合并成一段**。
+**已做**：`profile.sh --backend dcgm|nvswitch` 后端分派——两类采集都走同一套流水线，但**各自独立**（一个 run 一个后端）。
+
+**待定（非必需）**：一条命令**同时**起两类采集、共用同一 `runs/<id>/` 与时间窗（如 `--backend dcgm,nvswitch`）。
+当前若要两者对齐同一次跑，分别用两条 `profile.sh` 并各带 `--duration`/wrap 即可（marks 都是墙钟 epoch，可事后对齐）；
+是否值得做"单命令同采"等有需要再定（见 `PLAN.md`「工具架构」§1.2）。
 
 ---
 

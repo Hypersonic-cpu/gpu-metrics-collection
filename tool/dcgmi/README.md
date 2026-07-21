@@ -3,7 +3,8 @@
 这个目录 = **怎么用 `dcgmi dmon` 命令本身**采 GPU 侧 metric（HBM / SM / PCIe / GPU 侧 NVLink / 显存占用），
 外加本项目的**字段组文件**（`<name>.txt`）。`dcgmi` 是**宿主机**二进制（本机 DCGM 装在 host）。
 
-> - 整条采集流水线（起停 + 打墙钟戳 + wrap/attach + 解析出图）由上层 `tool/profile.sh` 编排 → 见项目 `README.md`。
+> - 整条采集流水线（起停 + 打墙钟戳 + wrap/attach + 解析出图）由上层 `tool/profile.sh` 编排（本工具 = 默认后端 `--backend dcgm`；
+>   过交换机流量是独立后端 `--backend nvswitch`，见 `tool/nvswitch_traffic/`）→ 见项目 `README.md`。
 > - 选哪个字段 / 字段语义 / 权限 / 坑的完整依据 → `docs/metrics_reference.md`（§1 选字段、§2 命令、§7 可用性）。
 
 ## 依赖

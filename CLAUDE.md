@@ -28,9 +28,9 @@
 | `README.md` | 项目入口（两类工具 + 一键脚本 TODO）—— **给用户看** | — |
 | `PLAN.md` | **当前/未来待做**（Phase 1 目标、工具架构、待做/待审核项）| 动手实现前 |
 | `PLAN_DONE.md` | **已完成/已锁定**（拍板的设计决策、已实现 MVP、实验对工具的结论）| 确认某决策是否已定 |
-| `tool/profile.sh`·`metrics.py`·`stamp.py` | DCGM 路径**高层/共用脚本**（入口 + 解析·绘图 + 打戳；`metrics.py parse`/`plot`）| 用法 → `tool/dcgmi/README.md`；架构 → `PLAN.md`「工具架构」|
+| `tool/profile.sh`·`metrics.py`·`stamp.py` | **两后端高层入口/共用脚本**（`--backend dcgm\|nvswitch` 各自独立采集；解析·绘图按 backend 自适应 + 打戳；`metrics.py parse`/`plot`）| 用法 → `tool/dcgmi/README.md` / `tool/nvswitch_traffic/README.md`；架构 → `PLAN.md`「工具架构」|
 | `tool/dcgmi/` | **① DCGM 工具**：README(快速上手) + 字段组 `<name>.txt`（`profile.sh --fields` 读它）| `tool/dcgmi/README.md` |
-| `tool/nvswitch_traffic/` | **② 自研 NSCQ 工具**（C + Makefile + README）：过交换机的 NVLink 流量 | `tool/nvswitch_traffic/README.md` |
+| `tool/nvswitch_traffic/` | **② 自研 NSCQ 工具**（C + Makefile + README + 配置组 `<name>.conf`）：过交换机的 NVLink 流量；可 `profile.sh --backend nvswitch` 编排 | `tool/nvswitch_traffic/README.md` |
 | `tool/workloads/` | 测试负载替身（`gpu_busy.py`）| — |
 | `experiments/cumemcpy/` | memcpy 三类点亮矩阵 + L2 影响（ground-truth）| README |
 | `experiments/dcgmi_pure/` | 采样频率地板(10Hz) + idle 底噪(只有 PCIe) | **先读 `SUMMARY.md`（地图）**再 README |
