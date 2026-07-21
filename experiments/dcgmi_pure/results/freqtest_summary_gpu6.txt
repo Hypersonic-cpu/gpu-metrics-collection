@@ -1,0 +1,16 @@
+# DCGM 内部更新率探针  gpu=6 count=2500  time0(rel)
+
+1field_1ms_h2dload: 数据行=2500  时长=7.22s
+    dmon 实际出行率   =   345.9 lines/s   (请求 -d 1 = 1000Hz)
+    非空样本占比      =    0.9%  (空读 99.1%)
+    ★内部更新率(非空) =     3.2 updates/s
+    ★内部更新率(变化) =     3.2 changes/s
+    raw log -> /home/yjdiao/Repos/metric_collection/experiments/dcgmi_pure/freqtest_1field_1ms_h2dload_gpu6.txt
+
+16field_1ms_h2dload: 数据行=2500  时长=8.62s
+    dmon 实际出行率   =   290.0 lines/s   (请求 -d 1 = 1000Hz)
+    非空样本占比      =    2.2%  (空读 97.8%)
+    ★内部更新率(非空) =     6.3 updates/s
+    ★内部更新率(变化) =     4.4 changes/s
+    raw log -> /home/yjdiao/Repos/metric_collection/experiments/dcgmi_pure/freqtest_16field_1ms_h2dload_gpu6.txt
+

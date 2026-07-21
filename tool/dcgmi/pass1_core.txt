@@ -1,0 +1,9 @@
+# pass1_core —— 第一遍：核心接口 utilization（说明见 tool/dcgmi/README.md；字段语义见 docs/metrics_reference.md §1）
+# 每行一个 dcgmi field id，# 开头为注释。parser/profile.sh 只取行首数字。
+1005   # dram_active        HBM 带宽利用率 (0-1, profiling)
+449    # nvlink_bandwidth_total  NVLink 总带宽 (MB/s, device 字段, 免 SYS_ADMIN)
+1011   # nvlink_tx_bytes     NVLink 发送 (bytes/间隔, profiling)
+1012   # nvlink_rx_bytes     NVLink 接收 (bytes/间隔, profiling)
+1009   # pcie_tx_bytes       PCIe 发送 (bytes/间隔, profiling; 有 ~17MB/s 自采底噪)
+1010   # pcie_rx_bytes       PCIe 接收 (bytes/间隔, profiling; 有 ~17MB/s 自采底噪)
+252    # fb_used             显存容量占用 (MB, device 字段; 供 validate 判空跑)

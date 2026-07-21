@@ -1,0 +1,14 @@
+backup
+tool/nvswitch_traffic/nvswitch_traffic
+runs/
+PLAN*md
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+.DS_Store
+*.swp
+.vscode/
+
+experiments/*/logs/
