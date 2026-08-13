@@ -121,6 +121,12 @@ def main(argv=None):
                        "--", moe_source]).returncode != 0:
         parser.error("official MoE CUDA source has local modifications: {}".format(
             tk_root / moe_source))
+    moe_benchmark = tk_root / "kernels/parallel/moe_dispatch_gemm/benchmark.py"
+    moe_text = moe_benchmark.read_text(encoding="utf-8")
+    seed_statement = "torch.random.manual_seed(42 + local_rank)"
+    if moe_text.count(seed_statement) != 1:
+        parser.error("official MoE benchmark no longer has the accel-sim-compatible "
+                     "routing seed statement: {}".format(seed_statement))
 
     print("[SUITE] cases={} out={} devices={} nsys_gpus={} duration={}s "
           "frequency={}Hz dcgm={}s".format(

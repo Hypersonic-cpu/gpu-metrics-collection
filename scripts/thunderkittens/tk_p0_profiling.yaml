@@ -12,6 +12,7 @@ profiling_defaults:
   nsys_start_delay_s: 30
   dcgm_duration_s: 5
 moe_variant_root: scripts/thunderkittens/moe_variants
+moe_routing_seed_base: 42
 
 groups:
   p0:
@@ -217,12 +218,12 @@ groups:
       entrypoint: _C.moe_dispatch_gemm
       target_kernel: dispatch_group_gemm_kernel
       source_path: kernels/parallel/moe_dispatch_gemm/moe_dispatch_gemm_h100.cu
-      logical: {B: 8, S: 1, M: 8, N: 2048, K: 4096, routed_per_expert: 0.1875}
-      execution: {B: 8, S: 1, M: 8, N: 2048, K: 4096, H: 4096, I: 2048, experts: 256, top_k: 6, routed_per_expert: 128}
+      logical: {B: 8, S: 1, M: 8, N: 2048, K: 4096, routed_per_expert: 0.25}
+      execution: {B: 8, S: 1, M: 8, N: 2048, K: 4096, H: 4096, I: 2048, experts: 256, top_k: 8, routed_per_expert: 128}
       runtime: {num_comm_sms: 28}
       exactness: Kernel de-hardcode; expert rows padded
       source_compatible: false
-      source_requirement: Compile H=4096 I=2048 TOP_K=6 NUM_EXPERTS=256 variant
+      source_requirement: Compile H=4096 I=2048 TOP_K=8 NUM_EXPERTS=256 variant
     TK048:
       case_id: TK048
       priority: P0
@@ -237,12 +238,12 @@ groups:
       entrypoint: _C.moe_dispatch_gemm
       target_kernel: dispatch_group_gemm_kernel
       source_path: kernels/parallel/moe_dispatch_gemm/moe_dispatch_gemm_h100.cu
-      logical: {B: 8, S: 1024, M: 8192, N: 2048, K: 4096, routed_per_expert: 192}
-      execution: {B: 8, S: 1024, M: 8192, N: 2048, K: 4096, H: 4096, I: 2048, experts: 256, top_k: 6, routed_per_expert: 256}
+      logical: {B: 8, S: 1024, M: 8192, N: 2048, K: 4096, routed_per_expert: 256}
+      execution: {B: 8, S: 1024, M: 8192, N: 2048, K: 4096, H: 4096, I: 2048, experts: 256, top_k: 8, routed_per_expert: 256}
       runtime: {num_comm_sms: 28}
       exactness: Kernel de-hardcode; expert rows padded
       source_compatible: false
-      source_requirement: Compile H=4096 I=2048 TOP_K=6 NUM_EXPERTS=256 variant
+      source_requirement: Compile H=4096 I=2048 TOP_K=8 NUM_EXPERTS=256 variant
     TK052:
       case_id: TK052
       priority: P0

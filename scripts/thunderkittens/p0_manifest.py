@@ -46,6 +46,8 @@ def load_manifest(path, group="p0"):
     require(policy.get("warmup_iters", 0) > 0, "warmup_iters must be positive")
     require(policy.get("native_iters", 0) > 0, "native_iters must be positive")
     require(policy.get("profile_iters", 0) > 0, "profile_iters must be positive")
+    require(manifest.get("moe_routing_seed_base") == 42,
+            "MoE routing seed base must match accel-sim: 42")
     for case_id, case in cases.items():
         prefix = "{}: ".format(case_id)
         require(case.get("case_id") == case_id, prefix + "case_id mismatch")
@@ -72,6 +74,8 @@ def load_manifest(path, group="p0"):
         else:
             require({"B", "S", "H", "I", "experts", "top_k"} <= set(execution),
                     prefix + "incomplete MoE shape")
+            require(execution["top_k"] == 8,
+                    prefix + "MoE top_k must match accel-sim: 8")
     return manifest, cases
 
 
@@ -79,4 +83,3 @@ def variant_name(execution):
     return "h{}_i{}_topk{}_experts{}".format(
         execution["H"], execution["I"], execution["top_k"],
         execution["experts"])
-

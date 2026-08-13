@@ -36,3 +36,8 @@ overflow；scheduler 不静默接受坏报告，后台 validator 会在终端把
 三组 MoE `_C` variant 默认生成到当前仓库的 `scripts/thunderkittens/moe_variants/`，不会修改
 ThunderKittens 或 accel-sim checkout。scheduler 在正式运行前自动补齐缺失 variant；若已经由外部
 构建，可传 `--skip-moe-build`。
+
+MoE 路由与 accel-sim P0 runner 一致：每个 rank 使用 seed `42 + rank`，rank 0 按官方
+`torch.rand -> repeat -> multinomial(replacement=False)` 生成路由并 broadcast。所有 MoE case 的
+`top_k` 均固定为 8；scheduler 会在启动前检查官方 benchmark 中的 seed 语句，manifest validator
+也会拒绝其他 seed 或 TopK。

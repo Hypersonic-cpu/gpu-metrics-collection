@@ -48,6 +48,22 @@ def main(argv=None):
     common_makefile = tk_root / "kernels/common.mk"
     original = source_path.read_text(encoding="utf-8")
     suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    try:
+        import pybind11
+        from torch.utils.cpp_extension import include_paths, library_paths
+    except ImportError as error:
+        parser.error("builder interpreter {} lacks ThunderKittens build dependency: {}"
+                     .format(sys.executable, error))
+    build_python = {
+        "PYTHON_VERSION={}".format(sysconfig.get_config_var("LDVERSION")),
+        "PYTHON_INCLUDES=-I{}".format(sysconfig.get_path("include")),
+        "PYTHON_LIBDIR=-L{}".format(sysconfig.get_config_var("LIBDIR")),
+        "PYBIND_INCLUDES=-I{}".format(pybind11.get_include()),
+        "PYTORCH_INCLUDES={}".format(
+            " ".join("-I{}".format(path) for path in include_paths())),
+        "PYTORCH_LIBDIR={}".format(
+            " ".join("-L{}".format(path) for path in library_paths())),
+    }
     for name, shape in sorted(shapes.items()):
         directory = args.output_root.resolve() / name
         generated = directory / "moe_dispatch_gemm_h100.cu"
@@ -60,12 +76,15 @@ def main(argv=None):
         directory.mkdir(parents=True, exist_ok=True)
         generated.write_text(specialized_source(original, shape), encoding="utf-8")
         env = os.environ.copy()
-        env["PATH"] = "{}:{}".format(pathlib.Path(sys.executable).resolve().parent,
+        # Do not resolve the venv's python symlink: resolving it turns
+        # .../.venv/bin/python3 into /usr/bin/python3, and common.mk invokes
+        # `python3` from PATH to discover pybind11/PyTorch include paths.
+        env["PATH"] = "{}:{}".format(pathlib.Path(sys.executable).parent,
                                       env.get("PATH", ""))
         subprocess.run([
             "make", "-f", str(common_makefile), "ARCH=SM90", "CONFIG=pytorch",
             "CMD=true", "SRC={}".format(generated), "OUT={}".format(output),
-        ], cwd=tk_root / "kernels", env=env, check=True)
+        ] + sorted(build_python), cwd=tk_root / "kernels", env=env, check=True)
     return 0
 
 
