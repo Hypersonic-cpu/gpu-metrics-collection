@@ -1,0 +1,689 @@
+#!/usr/bin/env bash
+# nsys-tool —— Nsight Systems 一键采集（GPU 硬件轨 / CPU 轨 / CUDA kernel 时间线）
+#
+# 与 profile.sh 两个后端（dcgm / nvswitch）的区别：那两个是旁路定时采样、10Hz 地板、输出逐行 CSV；
+# 本工具是 Nsight Systems，GPU 硬件指标默认 10kHz，输出二进制 .nsys-rep（用 nsys-ui 看）。
+# 别对同一张卡同时跑本工具和 profile.sh --backend dcgm（抢硬件计数器，见 docs/metrics_reference.md §3.2）。
+#
+# ── 三种用法 ────────────────────────────────────────────────────────────────
+#   ① gen（默认子命令）：一条命令 = start → 等 t 秒 → stop
+#        nsys-tool -i 4,5,7 -t 10              # 对已经在跑的东西开个 10 秒窗口
+#        nsys-tool -i 4,5,7 -t 0.5 -y 60       # 等 60 秒再采 0.5 秒
+#        nsys-tool -g nvlink -i 4,5,7 -t 10    # 换 metric 组（第二遍只看 NVLink）
+#
+#   ② wrap：把命令跑在 nsys 下，能拿到 CUDA kernel 甘特图
+#        nsys-tool -g cuda -i 4,5 -t 10 -y 60 -- python bench.py
+#
+#   ③ 三段式：窗口起止由外部条件决定，报告最小
+#        nsys-tool launch -g cuda -i 4,5 -- python server.py   # app 起来，暂不采
+#        nsys-tool gen -t 5                                     # 挂到该 session，采 5 秒
+#        # 或手动控制起止：
+#        nsys-tool start                                        # 到点了才开采
+#        nsys-tool stop --keep 30                               # 停并写盘；app 继续跑
+#        nsys-tool status | sessions | cancel | shutdown
+#
+#   ④ diagnose：查报告内部的 Warning/Error（nsys 只写进报告，stdout 不打）
+#        nsys-tool diagnose runs/<run 目录>        # 递归查目录下所有 report.nsys-rep
+#        nsys-tool diagnose <某个>/report.nsys-rep
+#        重点是 "GPU Metrics [N]: Sampling buffer overflow" —— 采样频率过高，该卡数据作废
+#
+# ── 能采到什么 / attach 的边界（本机实测，详见 tool/nsys/README.md）────────────
+#   GPU Metrics（SM/DRAM/NVLink/PCIe 连续曲线）  System scope   要 sudo   attach 能采 ✅
+#   CPU 采样 / 线程调度                          System scope   要 sudo   attach 能采 ✅
+#   CUDA kernel/memcpy 甘特图、NVTX(含 NCCL)     App scope      免 sudo   attach 采不到 ❌
+#   → 想看 kernel 甘特图必须用 wrap 或三段式；attach 配 CUDA 组本工具会直接报错。
+#
+# ── 参数 ────────────────────────────────────────────────────────────────────
+#   -i, --gpus 4,5,7    物理 GPU 编号（= nvidia-smi index）；也可 all / none / cuda-visible。默认 all
+#   -t, --time N        采集窗口秒数，浮点（如 0.5）。gen / wrap 必填
+#   -y, --delay N       窗口开始前的延迟秒数，浮点。默认 0
+#   -g, --group NAME    metric 组 -> tool/nsys/groups/<NAME>.conf。默认 pass1_core
+#       --freq HZ       GPU Metrics 采样频率（10-200000），覆盖组文件。默认见组文件（10000）
+#       --trace LIST    覆盖组文件的 trace 列表（如 cuda,nvtx,osrt）
+#       --name TAG      run 名，进目录名
+#       --note "..."    备注，写进 run README + runs/README.md
+#   -o, --out DIR       输出根目录。默认 <repo>/runs
+#       --in-container N  在指定容器里跑 nsys（容器需 --cap-add SYS_ADMIN 才能采 GPU Metrics）
+#       --keep N        仅 stop：只保留 stop 前 N 秒（环形缓冲，治报告过大）
+#       --stats         采完导出 sqlite（+ 有 trace 时跑 nsys stats 出 CSV）
+#       --session NAME  session 名。默认 nsystool
+#   -h, --help          本帮助
+#
+#   注意 -t 在本工具是「时长」，不是 nsys 原生的 --trace；trace 走 --trace。
+#
+# ── 环境变量 ────────────────────────────────────────────────────────────────
+#   NSYS_BIN=<路径>   指定用哪个 nsys 二进制（宿主机路径 / 容器内路径）。
+#                     用途：容器自带的 nsys 版本比宿主机 nsys-ui 新时，产出的 .nsys-rep 宿主机打不开
+#                     （GUI 版本必须 >= 产出版本）。把宿主机 nsight-systems 目录挂进容器再指过去即可。
+#
+# ── 一次 launch 开多个窗口 ──────────────────────────────────────────────────
+#   stop 之后 launch 状态会保留，可以接着再 gen（各自一个 run 目录），适合在一个长任务的
+#   不同阶段各采一段（如 prefill 一段 + decode 几段）。全部采完用 shutdown 收尾。
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
+
+# ---- 默认参数 ----
+GPUS="all"
+DURATION=""
+DELAY="0"
+GROUP="pass1_core"
+FREQ=""
+TRACE_OVR=""
+NAME=""
+NOTE=""
+OUTDIR="$REPO/runs"
+CONTAINER=""
+KEEP=""
+STATS=0
+SESSION="nsystool"
+CMD=()
+POSARGS=()          # 位置参数（目前只有 diagnose 用：要查的 run 目录 / 报告路径）
+
+usage() { tail -n +2 "$0" | grep '^#' | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+say()   { echo "[nsys] $*"; }
+die()   { echo "[nsys] ERROR: $*" >&2; exit 1; }
+
+# ---- 子命令（第一个位置参数）----
+SUBCMD="gen"
+case "${1:-}" in
+  gen|launch|start|stop|status|sessions|cancel|shutdown|diagnose) SUBCMD="$1"; shift;;
+esac
+
+# ---- 解析参数 ----
+GROUP_SET=0; GPUS_SET=0; CONTAINER_SET=0   # 用户是否显式给了 —— 决定要不要从 launch 状态继承
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -i|--gpus)      GPUS="$2"; GPUS_SET=1; shift 2;;
+    -t|--time|--duration) DURATION="$2"; shift 2;;
+    -y|--delay)     DELAY="$2"; shift 2;;
+    -g|--group)     GROUP="$2"; GROUP_SET=1; shift 2;;
+    --freq)         FREQ="$2"; shift 2;;
+    --trace)        TRACE_OVR="$2"; shift 2;;
+    --name)         NAME="$2"; shift 2;;
+    --note)         NOTE="$2"; shift 2;;
+    -o|--out)       OUTDIR="$2"; shift 2;;
+    --in-container) CONTAINER="$2"; CONTAINER_SET=1; shift 2;;
+    --keep)         KEEP="$2"; shift 2;;
+    --stats)        STATS=1; shift;;
+    --session)      SESSION="$2"; shift 2;;
+    --)             shift; CMD=("$@"); break;;
+    -h|--help)      usage 0;;
+    -*) echo "unknown arg: $1" >&2; usage;;
+    *)  POSARGS+=("$1"); shift;;
+  esac
+done
+
+is_num() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
+STATE="$OUTDIR/.nsys-tool.state"
+state_get() { [[ -f "$STATE" ]] && sed -n -E "s/^$1=(.*)$/\1/p" "$STATE" | head -1 || true; }
+
+# 后续子命令通常不重复写 -g/-i/--in-container，从 launch/start 存的状态里继承（必须早于 load_group）。
+# 尤其重要：launch 已经把 trace 焊进 session 了，gen/start 若退回默认组会采出一份没有 CUDA 轨的报告。
+if [[ -f "$STATE" ]] && [[ "$SUBCMD" != launch ]]; then
+  _g="$(state_get group)";     [[ "$GROUP_SET"     == 0 && -n "$_g" ]] && GROUP="$_g"
+  _i="$(state_get gpus)";      [[ "$GPUS_SET"      == 0 && -n "$_i" ]] && GPUS="$_i"
+  _c="$(state_get container)"; [[ "$CONTAINER_SET" == 0 && -n "$_c" ]] && CONTAINER="$_c"
+  # freq 也得继承：stop 会重新 load_group 来写 run_meta.json，不继承的话
+  # 「start --freq 200000」采到的窗口会被记成组文件里的默认值（10000），元数据对不上真实采样率。
+  _q="$(state_get freq)";      [[ -z "$FREQ"            && -n "$_q" ]] && FREQ="$_q"
+  _s="$(state_get session)";   [[ -n "$_s" ]] && SESSION="$_s"
+  true
+fi
+
+# ============================================================================
+# nsys 二进制定位 + 调用封装
+# ============================================================================
+resolve_nsys() {
+  # NSYS_BIN 覆盖：容器里的 nsys 版本可能比宿主机 nsys-ui 新，产出的报告宿主机打不开；
+  # 把宿主机的 nsight-systems 目录挂进容器再用 NSYS_BIN 指过去，就能产出宿主机 GUI 认的版本。
+  if [[ -n "${NSYS_BIN:-}" ]]; then
+    if [[ -n "$CONTAINER" ]]; then
+      docker inspect "$CONTAINER" >/dev/null 2>&1 || die "找不到容器: $CONTAINER"
+      docker exec "$CONTAINER" test -x "$NSYS_BIN" \
+        || die "容器 $CONTAINER 里没有可执行的 NSYS_BIN=$NSYS_BIN"
+    else
+      [[ -x "$NSYS_BIN" ]] || die "NSYS_BIN 不可执行: $NSYS_BIN"
+    fi
+    NSYS="$NSYS_BIN"; return 0
+  fi
+  if [[ -n "$CONTAINER" ]]; then
+    docker inspect "$CONTAINER" >/dev/null 2>&1 || die "找不到容器: $CONTAINER"
+    NSYS="$(docker exec "$CONTAINER" sh -c 'command -v nsys' 2>/dev/null || true)"
+    [[ -n "$NSYS" ]] || die "容器 $CONTAINER 里没有 nsys"
+  else
+    NSYS="$(pick_newest_nsys)"
+    [[ -n "$NSYS" ]] || die "找不到 nsys（本机在 /usr/local/cuda/bin/nsys）"
+  fi
+}
+
+# 需要 root 的调用（start / stop）；容器内本身就是 root
+nsys_root() {
+  if [[ -n "$CONTAINER" ]]; then docker exec "$CONTAINER" "$NSYS" "$@"
+  elif [[ "${NEED_SUDO:-0}" == 1 ]]; then sudo -n -E "$NSYS" "$@"
+  else "$NSYS" "$@"; fi
+}
+# 以普通用户身份跑（launch / sessions / status）——被测程序不该跑在 root 下
+nsys_user() {
+  if [[ -n "$CONTAINER" ]]; then docker exec "$CONTAINER" "$NSYS" "$@"
+  else "$NSYS" "$@"; fi
+}
+# 过滤 nsys 写盘 / export 时的进度条刷屏（stop 用 \r，export 用整行百分比）
+strip_progress() {
+  tr '\r' '\n' | grep -vE '^\[[0-9]+/[0-9]+\]|^\[=*[0-9]+%|^Processing [0-9]+ events|^$' || true
+}
+
+# ============================================================================
+# metric 组
+# ============================================================================
+conf_get() {
+  local v
+  v="$(sed -n -E "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*(.*)$/\1/p" "$CONF" | head -1)"
+  v="${v%%#*}"; v="$(printf '%s' "$v" | tr -d '[:space:]')"
+  [[ -n "$v" ]] && printf '%s' "$v" || printf '%s' "$2"
+}
+
+load_group() {
+  CONF="$HERE/groups/${GROUP}.conf"
+  if [[ ! -f "$CONF" ]]; then
+    die "metric 组不存在: $CONF
+       可选: $(ls "$HERE"/groups/*.conf 2>/dev/null | xargs -n1 basename | sed 's/\.conf$//' | paste -sd' ' -)"
+  fi
+  G_TRACE="$(conf_get trace none)"
+  G_CGTRACE="$(conf_get cuda_graph_trace none)"
+  G_SAMPLE="$(conf_get sample none)"
+  G_CTXSW="$(conf_get cpuctxsw none)"
+  G_SET="$(conf_get gpu_metrics_set none)"
+  G_FREQ="$(conf_get gpu_metrics_freq 10000)"
+  [[ -n "$TRACE_OVR" ]] && G_TRACE="$TRACE_OVR"
+  [[ -n "$FREQ" ]]      && G_FREQ="$FREQ"
+
+  # 要不要 root，取决于两把互相独立的锁：
+  #   GPU Metrics -> 驱动的 RmProfilingAdminOnly（本机=1，恒需 root）
+  #   CPU 采样    -> 内核的 perf_event_paranoid：process-tree 需 <=2，system-wide 需 <=0
+  # CUDA trace（CUPTI Activity API）两把锁都不管，永远免 sudo。
+  local par; par="$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 99)"
+  NEED_SUDO=0
+  [[ "$G_SET" != none ]] && NEED_SUDO=1
+  if [[ "$G_SAMPLE" == system-wide || "$G_CTXSW" == system-wide ]]; then
+    [[ "$par" -le 0 ]] || NEED_SUDO=1
+  elif [[ "$G_SAMPLE" != none || "$G_CTXSW" != none ]]; then
+    [[ "$par" -le 2 ]] || NEED_SUDO=1
+  fi
+  [[ -n "$CONTAINER" ]] && NEED_SUDO=0   # 容器内已是 root
+
+  # file:<相对路径> -> 绝对路径；容器模式则先 cp 进去
+  G_SET_LOCAL=""
+  if [[ "$G_SET" == file:* ]]; then
+    local rel="${G_SET#file:}"
+    [[ "$rel" == /* ]] || rel="$HERE/$rel"
+    [[ -f "$rel" ]] || die "metric set 文件不存在: $rel"
+    G_SET_LOCAL="$rel"
+    if [[ -n "$CONTAINER" ]]; then
+      docker exec "$CONTAINER" mkdir -p /tmp/nsystool/sets
+      docker cp "$rel" "$CONTAINER:/tmp/nsystool/sets/$(basename "$rel")" >/dev/null
+      G_SET="file:/tmp/nsystool/sets/$(basename "$rel")"
+    else
+      G_SET="file:$rel"
+    fi
+  fi
+}
+
+# ============================================================================
+# GPU 编号：host 上 nsys id == nvidia-smi index（实测）；容器内会重编号，按 PCI 匹配
+# ============================================================================
+resolve_gpus() {
+  GPU_ARG="$GPUS"
+  [[ "$GPUS" == all || "$GPUS" == none || "$GPUS" == cuda-visible ]] && return 0
+
+  # 容器内换算一次要跑 docker exec + nsys（实测 2–4s）。多窗口场景下每个 gen 都重算会把
+  # 窗口起点整体推后，短窗口（2–3s）根本对不准阶段 —— 所以 launch 时算好存进状态文件复用。
+  if [[ -n "$CONTAINER" && "$GPUS_SET" == 0 ]]; then
+    local cached; cached="$(state_get gpus_nsys)"
+    [[ -n "$cached" ]] && { GPU_ARG="$cached"; return 0; }
+  fi
+
+  local pci_of=() out phys mapped=() p cid
+  # host: 物理编号 -> PCI（归一化成 xx:yy.z 小写）
+  while IFS=, read -r idx bus; do
+    idx="$(printf '%s' "$idx" | tr -d '[:space:]')"
+    bus="$(printf '%s' "$bus" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+    pci_of[$idx]="${bus: -7}"
+  done < <(nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader)
+
+  IFS=',' read -ra mapped <<< "$GPUS"
+  for phys in "${mapped[@]}"; do
+    [[ -n "${pci_of[$phys]:-}" ]] \
+      || die "本机没有物理 GPU $phys（有效编号 0-$((${#pci_of[@]}-1))，见 nvidia-smi）"
+  done
+  [[ -z "$CONTAINER" ]] && return 0
+
+  # 容器内: nsys id -> PCI
+  out="$(docker exec "$CONTAINER" "$NSYS" profile --gpu-metrics-devices=help 2>&1 || true)"
+  if ! printf '%s' "$out" | grep -qE '^[[:space:]]*[0-9]+:'; then
+    die "容器 $CONTAINER 里列不出 GPU（多半缺 --cap-add SYS_ADMIN）：
+$(printf '%s' "$out" | head -4)"
+  fi
+
+  local res=()
+  for phys in "${mapped[@]}"; do
+    p="${pci_of[$phys]}"
+    cid="$(printf '%s' "$out" | tr 'A-Z' 'a-z' \
+           | sed -n -E "s/^[[:space:]]*([0-9]+):.*pci\[[0-9a-f]*:?($p)\].*/\1/p" | head -1)"
+    [[ -n "$cid" ]] || die "物理 GPU $phys (PCI $p) 没有映射进容器 $CONTAINER"
+    res+=("$cid")
+  done
+  GPU_ARG="$(IFS=,; echo "${res[*]}")"
+  say "GPU 重映射（容器 $CONTAINER）: 物理 $GPUS -> 容器内 $GPU_ARG"
+}
+
+# ============================================================================
+# run 目录 / 收尾
+# ============================================================================
+mark() { [[ -n "${RUNDIR:-}" ]] && printf '%s\t%s\n' "$(date +%s.%3N)" "$1" >> "$RUNDIR/marks.txt"; return 0; }
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+make_rundir() {
+  RUN_ID="nsys_${GROUP}${NAME:+_$NAME}__$(date +%Y%m%d-%H%M%S)"
+  RUNDIR="$OUTDIR/$RUN_ID"
+  mkdir -p "$RUNDIR"
+  : > "$RUNDIR/marks.txt"
+}
+
+write_run_readme() {
+  {
+    echo "# run $RUN_ID"
+    echo
+    [[ -n "$NOTE" ]] && { echo "$NOTE"; echo; }
+    echo "## meta"
+    echo "- **host**: $(uname -n)"
+    echo "- **backend**: nsys ($NSYS_VER)"
+    echo "- **group**: $GROUP"
+    echo "- **gpus**: $GPUS (nsys: $GPU_ARG)"
+    echo "- **gpu_metrics**: $G_SET @ ${G_FREQ}Hz"
+    echo "- **trace**: $G_TRACE / cuda_graph_trace: $G_CGTRACE / sample: $G_SAMPLE / cpuctxsw: $G_CTXSW"
+    echo "- **mode**: $MODE"
+    echo "- **duration_s**: ${DURATION:-—} / **delay_s**: $DELAY"
+    [[ -n "$CONTAINER" ]] && echo "- **container**: $CONTAINER"
+    [[ ${#CMD[@]} -gt 0 ]] && echo "- **cmd**: \`${CMD[*]}\`"
+    echo
+    echo "## 怎么看"
+    echo '```bash'
+    echo "nsys-ui $RUNDIR/report.nsys-rep       # GUI（版本需 >= $NSYS_VER）"
+    echo "nsys stats $RUNDIR/report.nsys-rep    # 命令行摘要"
+    echo '```'
+  } > "$RUNDIR/README.md"
+  return 0
+}
+
+append_index() {
+  local idx="$OUTDIR/README.md" n
+  if [[ ! -f "$idx" ]]; then
+    {
+      echo "# runs 索引"; echo
+      echo "每次采集一行（最新在下）。详情见各 run 目录的 README.md。"; echo
+      echo "| run | backend | note |"; echo "|---|---|---|"
+    } > "$idx"
+  fi
+  n="${NOTE//$'\n'/ }"; n="${n//|/\\|}"; [[ -z "$n" ]] && n="—"
+  printf '| [%s](%s/README.md) | %s | %s |\n' "$RUN_ID" "$RUN_ID" "nsys/$GROUP" "$n" >> "$idx"
+}
+
+finalize() {
+  [[ -f "$RUNDIR/run_meta.json" ]] && return 0
+  cat > "$RUNDIR/run_meta.json" <<EOF
+{
+  "run_id": "$RUN_ID",
+  "host": "$(uname -n)",
+  "backend": "nsys",
+  "nsys_version": "$NSYS_VER",
+  "group": "$GROUP",
+  "gpus": "$GPUS",
+  "gpus_nsys": "$GPU_ARG",
+  "gpu_metrics_set": "$(json_escape "$G_SET")",
+  "gpu_metrics_freq": $G_FREQ,
+  "trace": "$G_TRACE",
+  "cuda_graph_trace": "$G_CGTRACE",
+  "nsys_bin": "$(json_escape "$NSYS")",
+  "sample": "$G_SAMPLE",
+  "cpuctxsw": "$G_CTXSW",
+  "sudo": $([[ "$NEED_SUDO" == 1 ]] && echo true || echo false),
+  "container": "$(json_escape "$CONTAINER")",
+  "mode": "$MODE",
+  "duration_s": "${DURATION:-}",
+  "delay_s": "$DELAY",
+  "note": "$(json_escape "$NOTE")",
+  "workload_rc": ${RC:-0}
+}
+EOF
+  write_run_readme
+  append_index
+}
+
+# ============================================================================
+# 动作
+# ============================================================================
+do_launch() {   # 起 app（普通用户身份），session 建好但先不采
+  [[ ${#CMD[@]} -gt 0 ]] || die "launch 需要在 -- 之后给命令"
+  mkdir -p "$OUTDIR"
+  local llog="$OUTDIR/.nsys-tool.launch.log"
+  local largs=( --session-new="$SESSION" -t "$G_TRACE" )
+  # CUDA graph 的粒度：默认 'graph' 把整张图折成一条，图里的 kernel 全看不见。
+  # 被测程序用 CUDA graph（如 sglang 的 decode）时必须 'node' 才有逐 kernel 甘特图。
+  local cgmsg=""
+  [[ "$G_CGTRACE" != none ]] && { largs+=( --cuda-graph-trace="$G_CGTRACE" ); cgmsg="  cuda-graph-trace=$G_CGTRACE"; }
+  say "launch: ${CMD[*]}"
+  say "  trace=$G_TRACE$cgmsg  session=$SESSION  （尚未开始采集，用 nsys-tool gen/start 开窗口）"
+  nsys_user launch "${largs[@]}" -- "${CMD[@]}" > "$llog" 2>&1 &
+  LAUNCH_PID=$!
+  {
+    echo "session=$SESSION"
+    echo "launched=1"
+    echo "group=$GROUP"
+    echo "gpus=$GPUS"
+    echo "gpus_nsys=$GPU_ARG"
+    echo "freq=$G_FREQ"
+    echo "container=$CONTAINER"
+    echo "launch_pid=$LAUNCH_PID"
+    echo "launch_log=$llog"
+    echo "launch_epoch=$(date +%s.%3N)"
+  } > "$STATE"
+  # 等 session 真的建起来，免得紧接着的 start 找不到它
+  local i
+  for i in $(seq 1 50); do
+    nsys_user sessions list 2>/dev/null | grep -q "$SESSION" && break
+    sleep 0.2
+  done
+  nsys_user sessions list 2>/dev/null | grep -q "$SESSION" \
+    || die "session $SESSION 没起来，见 $llog"
+}
+
+# attach（既没有 -- <命令>，也没有 launch 过的 session）配 CUDA 组是拿不到 trace 的，早点报错
+check_attach_trace() {
+  [[ "$G_TRACE" == none ]] && return 0
+  [[ ${#CMD[@]} -gt 0 ]] && return 0
+  [[ "$(state_get launched)" == "1" ]] && return 0
+  die "attach 模式拿不到 CUDA 轨（--trace 是 Application scope，必须在进程启动时注入）。
+       组 '$GROUP' 带 trace=$G_TRACE，请改用：
+         wrap   : nsys-tool -g $GROUP -i $GPUS -t ${DURATION:-N} -- <你的命令>
+         三段式 : nsys-tool launch -g $GROUP -- <你的命令>  然后  nsys-tool gen -t ${DURATION:-N}
+       只想看 GPU 硬件轨就换组：-g pass1_core / dram / nvlink / pcie"
+}
+
+do_start() {
+  local sess_flag="--session-new=$SESSION"
+  if [[ "$(state_get launched)" == "1" ]]; then
+    SESSION="$(state_get session)"
+    sess_flag="--session=$SESSION"
+  elif [[ "$G_TRACE" != none ]]; then
+    die "attach 模式拿不到 CUDA 轨（--trace 是 Application scope，必须在进程启动时注入）。
+       组 '$GROUP' 带 trace=$G_TRACE，请改用：
+         wrap   : nsys-tool -g $GROUP -i $GPUS -t ${DURATION:-N} -- <你的命令>
+         三段式 : nsys-tool launch -g $GROUP -- <你的命令>  然后  nsys-tool gen -t ${DURATION:-N}
+       只想看 GPU 硬件轨就换组：-g pass1_core / dram / nvlink / pcie"
+  fi
+
+  make_rundir
+  local le; le="$(state_get launch_epoch)"
+  [[ -n "$le" ]] && printf '%s\t%s\n' "$le" "app_launch" >> "$RUNDIR/marks.txt"
+
+  local rep_base="$RUNDIR/report"
+  [[ -n "$CONTAINER" ]] && {
+    docker exec "$CONTAINER" mkdir -p "/tmp/nsystool/$RUN_ID"
+    rep_base="/tmp/nsystool/$RUN_ID/report"
+  }
+
+  local args=( "$sess_flag" -o "$rep_base" -f true -s "$G_SAMPLE" --cpuctxsw="$G_CTXSW" )
+  [[ "$G_SET" != none ]] && args+=( --gpu-metrics-devices="$GPU_ARG"
+                                    --gpu-metrics-set="$G_SET"
+                                    --gpu-metrics-frequency="$G_FREQ" )
+
+  say "start: group=$GROUP gpus=$GPUS metrics=$G_SET@${G_FREQ}Hz trace=$G_TRACE sudo=$NEED_SUDO"
+  # start_cmd_begin / window_start 一起打：nsys 是在【命令发出去】之后不久就开始收数据的，
+  # 不是等命令返回才开始。两者之差 = start 命令自身耗时，也就是报告会比 -t 多出来的前半截。
+  mark "start_cmd_begin"
+  if ! nsys_root start "${args[@]}" 2>&1 | strip_progress; then
+    rm -rf "$RUNDIR"; rm -f "$STATE"          # 别留下只有 marks.txt 的空目录
+    die "nsys start 失败（见上面的输出）"
+  fi
+  mark "window_start"
+
+  # 保留 launch 阶段写下的键，再补上本次 start 的
+  local keep=""
+  [[ -f "$STATE" ]] && keep="$(grep -E '^(launched|launch_pid|launch_log|launch_epoch)=' "$STATE" || true)"
+  {
+    [[ -n "$keep" ]] && printf '%s\n' "$keep"
+    echo "session=$SESSION"
+    echo "rundir=$RUNDIR"
+    echo "run_id=$RUN_ID"
+    echo "report_base=$rep_base"
+    echo "started=1"
+    echo "group=$GROUP"
+    echo "gpus=$GPUS"
+    echo "gpus_nsys=$GPU_ARG"
+    echo "freq=$G_FREQ"
+    echo "container=$CONTAINER"
+    echo "mode=$MODE"
+  } > "$STATE"
+  say "采集中 -> $RUNDIR"
+}
+
+# do_stats <容器名|空> <报告路径> <输出目录> —— 路径都得是「跑 nsys 的那一侧」看得见的。
+# 整段非致命：stats 失败不该让 run_meta.json / README 收不了尾。
+do_stats() {
+  local ctr="$1" rep="$2" dir="$3" run=()
+  [[ -n "$ctr" ]] && run=(docker exec "$ctr" "$NSYS") || run=("$NSYS")
+  say "导出 sqlite$([[ "$G_TRACE" != none ]] && echo ' / stats') ..."
+  "${run[@]}" export --type sqlite --force-overwrite true -o "$dir/report.sqlite" "$rep" 2>&1 \
+    | strip_progress || say "WARN: export sqlite 失败（不影响报告本身）"
+  if [[ "$G_TRACE" != none ]]; then
+    [[ -n "$ctr" ]] && docker exec "$ctr" mkdir -p "$dir/stats" || mkdir -p "$dir/stats"
+    "${run[@]}" stats --force-export true --format csv --output "$dir/stats/s" "$rep" 2>&1 \
+      | strip_progress || say "WARN: nsys stats 失败（不影响报告本身）"
+  fi
+  return 0
+}
+
+# 宿主机上挑一个 nsys —— 按【版本】取最新，不能只信 PATH。
+# 坑：本机 PATH 里的 nsys 是 /usr/local/cuda-12.8/bin/nsys (2024.6.2)，比报告的产出版本旧，
+# 拿它读新报告会报 "Please update your Nsight Systems to the latest version to view this report."
+# 而 /usr/local/cuda/bin/nsys 是 2025.5.2。想固定用某个：NSYS_HOST_BIN=<路径>。
+pick_newest_nsys() {
+  local p v best="" bestv=0 n
+  [[ -n "${NSYS_HOST_BIN:-}" && -x "${NSYS_HOST_BIN}" ]] && { printf '%s' "$NSYS_HOST_BIN"; return 0; }
+  for p in "$(command -v nsys 2>/dev/null || true)" \
+           /usr/local/cuda/bin/nsys /usr/local/cuda-*/bin/nsys /opt/nvidia/nsight-systems/*/bin/nsys; do
+    [[ -n "$p" && -x "$p" ]] || continue
+    v="$("$p" --version 2>/dev/null | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+' | head -1)"
+    [[ -n "$v" ]] || continue
+    # 2025.5.2 -> 20250500002 这类可比大小的整数
+    n=$(awk -F. '{printf "%d%03d%05d", $1, $2, $3}' <<<"$v")
+    (( n > bestv )) && { best="$p"; bestv=$n; }
+  done
+  [[ -n "$best" ]] && { printf '%s' "$best"; return 0; }
+  return 1
+}
+# 读报告要用宿主机侧的：$NSYS 在容器模式下是容器内路径（且报告 stop 时已 docker cp 回宿主机、
+# 容器内那份被删了）。
+host_nsys() { pick_newest_nsys; }
+
+# nsys 把采集期的告警/错误只写进报告内部（GUI 的 Diagnostics 页），stdout 一个字都不打。
+# 最坑的是 "GPU Metrics [N]: Sampling buffer overflow"：它是 Error 级，出现时那张卡的样本会整段
+# 错位到窗口之外（实测 200 kHz 双卡必现），但 rc 仍是 0、报告照样生成 —— 不主动查就会拿着废数据分析。
+#
+# 为什么做成独立子命令而不是塞进 stop：读诊断要先 export sqlite（14 MB 报告 ~1.1s，`cuda` 组那种
+# 200 MB+ 的更久）。塞进 stop 就等于给【每个窗口】加这份开销，会把窗口起点整体往后推
+# —— 那正是之前费劲修掉的漂移问题。所以放在最后一次性查，顺便也能回头查旧 run。
+do_diagnose() {  # <run 目录 或 report.nsys-rep> ...
+  # 判定逻辑全在 check_report.py（要读 sqlite 做逐设备的数据体检，bash 写不动）。
+  # 这里只做转发 + 把宿主机 nsys 传过去。
+  local hn; hn="$(pick_newest_nsys)" || die "宿主机上找不到 nsys，没法读报告"
+  command -v python3 >/dev/null || die "需要 python3"
+  NSYS_HOST_BIN="$hn" python3 "$HERE/check_report.py" "$@"
+  return $?
+}
+
+do_stop() {
+  local sess="${SESSION}"
+  [[ -n "$(state_get session)" ]] && sess="$(state_get session)"
+  RUNDIR="${RUNDIR:-$(state_get rundir)}"
+  RUN_ID="${RUN_ID:-$(state_get run_id)}"
+  [[ -n "$RUNDIR" ]] || die "没有进行中的采集（$STATE 里没有 rundir）"
+
+  mark "window_end"
+  local args=( --session="$sess" )
+  if [[ -n "$KEEP" ]]; then
+    # 实测：--keep 给子秒值（0.2）时 nsys 把数据全丢掉，连报告都不写（rc 仍是 0）。
+    # 环形缓冲按块截断，切不出这么细的粒度 —— 与其静默产出空报告，不如先喊一声。
+    if awk -v k="$KEEP" 'BEGIN{exit !(k+0 < 2)}'; then
+      say "WARN: --keep $KEEP 小于 2s，实测会截出空报告（nsys 静默不写盘）。想要短窗口请用 -t，别用 --keep。"
+    fi
+    args+=( --keep="$KEEP" )
+  fi
+  say "stop: session=$sess${KEEP:+ （只保留最后 ${KEEP}s）}"
+  nsys_root stop "${args[@]}" 2>&1 | strip_progress
+  # window_end → stop_cmd_done = stop 命令自身耗时（含落盘）。采集要到这个命令真正生效才停，
+  # 所以这段也会算进报告时间跨度里 —— 报告比 -t 长多少，看 start_cmd_begin → stop_cmd_done。
+  mark "stop_cmd_done"
+
+  local rep="$RUNDIR/report.nsys-rep"
+  if [[ -n "$CONTAINER" ]]; then
+    # 报告在容器里。stats 也必须在容器里做（用容器路径，且容器 nsys 版本才读得懂自己产的报告），做完再一起 cp 回来。
+    local rb ctr_dir; rb="$(state_get report_base)"; ctr_dir="$(dirname "$rb")"
+    [[ "$STATS" == 1 ]] && do_stats "$CONTAINER" "${rb}.nsys-rep" "$ctr_dir"
+    docker cp "$CONTAINER:$ctr_dir/." "$RUNDIR/" >/dev/null 2>&1 \
+      || say "WARN: 没能从容器取回报告（$ctr_dir）"
+    docker exec "$CONTAINER" rm -rf "$ctr_dir" >/dev/null 2>&1 || true
+  else
+    [[ "$STATS" == 1 ]] && do_stats "" "$rep" "$RUNDIR"
+  fi
+
+  # sudo 建的 session 产出的文件属主是 root，还给当前用户
+  if [[ -n "$(find "$RUNDIR" -maxdepth 2 ! -user "$(id -un)" -print -quit 2>/dev/null)" ]]; then
+    sudo -n chown -R "$(id -u):$(id -g)" "$RUNDIR" 2>/dev/null || true
+  fi
+
+  # 三段式的 app 日志归档进 run 目录
+  local llog; llog="$(state_get launch_log)"
+  [[ -n "$llog" && -f "$llog" && ! -f "$RUNDIR/workload.log" ]] && cp "$llog" "$RUNDIR/workload.log"
+
+  mark "session_stop"
+  finalize
+  # 一次 launch 要开好几个窗口（prefill 一个、decode 几个），所以 stop 之后只清掉本窗口的键，
+  # 保留 launch 段——不然下一个 gen 找不到 session，会退回 attach 采出一份没有 CUDA 轨的报告。
+  # 彻底收尾（连 app 一起结束）走 nsys-tool shutdown / cancel。
+  if [[ "$(state_get launched)" == "1" ]]; then
+    if grep -E '^(session|launched|launch_pid|launch_log|launch_epoch|group|gpus|gpus_nsys|freq|container)=' \
+         "$STATE" > "$STATE.tmp" 2>/dev/null; then mv "$STATE.tmp" "$STATE"
+    else rm -f "$STATE" "$STATE.tmp"; fi
+    say "session $sess 保留中（app 继续跑）：可再 nsys-tool gen 开下一个窗口，收尾用 nsys-tool shutdown"
+  else
+    rm -f "$STATE"
+  fi
+  if [[ -f "$rep" ]]; then
+    say "完成 -> $rep ($(du -h "$rep" | cut -f1))"
+    say "看报告: nsys-ui $rep    或    nsys stats $rep"
+  else
+    say "WARN: 没生成报告。nsys 在「一条数据都没采到」时会静默跳过写盘（rc 仍为 0）。
+       常见原因：组里 gpu_metrics_set=none 且被测程序在窗口内没跑任何 CUDA/NVTX。
+       换个带 GPU Metrics 的组（-g pass1_core）或确认窗口盖住了真正在跑的那段。"
+  fi
+}
+
+# ============================================================================
+# main
+# ============================================================================
+mkdir -p "$OUTDIR"
+
+# diagnose 只读报告：不需要解析组、不需要容器里的 nsys，所以在 resolve_nsys 之前就分派掉
+if [[ "$SUBCMD" == diagnose ]]; then
+  [[ ${#POSARGS[@]} -gt 0 ]] || POSARGS=("$OUTDIR")
+  do_diagnose "${POSARGS[@]}"; exit $?
+fi
+
+resolve_nsys
+load_group
+NSYS_VER="$( (nsys_user --version 2>/dev/null || true) | grep -oE '[0-9]{4}\.[0-9.]+' | head -1)"
+NSYS_VER="${NSYS_VER:-unknown}"
+
+case "$SUBCMD" in
+  status)   nsys_user status "$@" 2>&1 | strip_progress; exit 0;;
+  sessions) nsys_user sessions list 2>&1 | strip_progress; exit 0;;
+  cancel)   nsys_root cancel --session="$(state_get session || echo "$SESSION")" 2>&1 | strip_progress
+            rm -f "$STATE"; say "已取消并丢弃数据"; exit 0;;
+  shutdown) nsys_user shutdown --session="$(state_get session || echo "$SESSION")" 2>&1 | strip_progress
+            rm -f "$STATE"; say "已关闭 session（被 launch 的 app 也会被结束）"; exit 0;;
+esac
+
+if [[ "$NEED_SUDO" == 1 ]]; then
+  sudo -n true 2>/dev/null || die "组 '$GROUP' 需要 root（GPU Metrics / 全系统 CPU 采样），但 sudo -n 不可用。
+       只想要 kernel 甘特图可以换免 sudo 的组：-g cuda_lite"
+fi
+
+resolve_gpus
+RC=0
+
+case "$SUBCMD" in
+  launch)
+    [[ ${#CMD[@]} -gt 0 ]] || die "launch 需要 -- <命令>"
+    do_launch
+    say "app 已在 nsys 下运行（pid $LAUNCH_PID）。开窗口: nsys-tool gen -t <秒>"
+    ;;
+
+  start)
+    [[ -z "$(state_get started)" ]] || die "已经有采集在进行中（$STATE）。先 nsys-tool stop 或 cancel"
+    check_attach_trace
+    MODE="manual"
+    do_start
+    say "停止: nsys-tool stop [--keep N]"
+    ;;
+
+  stop)
+    MODE="$(state_get mode)"; MODE="${MODE:-manual}"
+    do_stop
+    ;;
+
+  gen)
+    is_num "$DURATION" || die "gen 需要 -t <秒数>（浮点，如 -t 0.5）"
+    is_num "$DELAY"    || die "-y 必须是数字"
+    check_attach_trace
+
+    if [[ ${#CMD[@]} -gt 0 ]]; then
+      # wrap：自己 launch，自己等，自己收
+      MODE="wrap"
+      do_launch
+    else
+      MODE="$([[ "$(state_get launched)" == "1" ]] && echo attach-launched || echo attach)"
+    fi
+
+    if [[ "$DELAY" != "0" ]]; then say "等 ${DELAY}s 再开采..."; sleep "$DELAY"; fi
+    do_start
+    say "采 ${DURATION}s ..."
+    sleep "$DURATION"
+
+    if [[ "$MODE" == "wrap" ]]; then
+      do_stop
+      say "等 workload 结束（Ctrl-C 可提前退出，app 会被 shutdown）..."
+      wait "$LAUNCH_PID" || RC=$?
+      say "workload 结束 (rc=$RC)，见 $RUNDIR/workload.log"
+      cp "$(state_get launch_log 2>/dev/null || echo /dev/null)" "$RUNDIR/workload.log" 2>/dev/null || true
+      [[ -f "$OUTDIR/.nsys-tool.launch.log" ]] && cp "$OUTDIR/.nsys-tool.launch.log" "$RUNDIR/workload.log"
+      python3 - "$RUNDIR/run_meta.json" "$RC" <<'PY' 2>/dev/null || true
+import json,sys
+p,rc=sys.argv[1],int(sys.argv[2])
+d=json.load(open(p)); d["workload_rc"]=rc
+json.dump(d,open(p,"w"),indent=2,ensure_ascii=False)
+PY
+      rm -f "$STATE"   # wrap 是自包含的一次性流程，app 已结束，别把 launch 状态留给下一次调用
+    else
+      do_stop
+    fi
+    ;;
+esac
+
+exit "$RC"

@@ -41,6 +41,11 @@ dcgmi dmon -e "$(grep -oE '^[0-9]+' tool/dcgmi/pass1_core.txt | paste -sd, -)" -
 - ★ **warmup**：byte/profiling 字段头 ~2 拍返回 `N/A`，第 3 拍起才出真值 → **至少跑 5 拍**再信；短测 `-c 3` 易误判"字段坏"。
 - ★ **byte 字段已是速率、不用差分**：`pcie_*_bytes`/`nvlink_*_bytes` 是 bytes/秒（1Hz 与 10Hz 原始值一致）→ `GB/s = 值/1e9`。
 
+## 出图与 NVLink 带宽
+- `metrics.py plot` 出 4 格 trace：`dram_active`(HBM 利用率 0–1) · **`nvlink bw`(GB/s 双向合计)** · `pcie_rx`/`pcie_tx`(GB/s)。
+- **NVLink 画绝对带宽、不画利用率%**（本仓库不给它的峰值分母定数）：面板优先用聚合 `449`（MB/s ÷ 1000），
+  没有 449 就按 `t_rel` join `(tx+rx)/1e9`；`parse` 控制台按方向报 tx/rx 的 GB/s。见 `metrics_reference` §5.2。
+
 ## 权限
 - **profiling 字段**（id≥1000：`dram_active`/`sm_active`/`pcie_*_bytes`/`nvlink_*_bytes`/`tensor_active`…）：容器内需 `--cap-add SYS_ADMIN`。
 - **device 字段**（id<1000：`449 nvlink_bandwidth_total`/`252 fb_used`/`204 mem_copy_util`…）：免额外权限。

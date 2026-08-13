@@ -18,6 +18,9 @@
 #        --lead N  命令启动【前】先空采 N 秒基线（默认 2）
 #        --lag  N  命令结束【后】再续采 N 秒等流量回落（默认 3）；设 0 关闭
 #
+#   --note "一段话"  给这次采集写说明（方便之后分类）：写进 runs/<id>/README.md（单 run 详情）
+#                    + 追加到 runs/README.md（总索引一行）+ 存进 run_meta.json 的 note 字段。
+#
 # dcgm 用 --gpus 选【物理卡号】；nvswitch 用配置组里的 switches 选 switch。
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,6 +35,7 @@ OUTDIR="$HERE/../runs"
 DURATION=""             # attach 模式的秒数
 LEAD=2                  # wrap: 命令前空采基线秒数
 LAG=3                   # wrap: 命令后续采（等流量回落空载）秒数
+NOTE=""                 # 这次采集的说明（--note），写进 README + run_meta.json
 CMD=()                  # wrap 模式的命令（-- 之后）
 
 usage() { grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
@@ -48,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --duration)    DURATION="$2"; shift 2;;
     --lead)        LEAD="$2"; shift 2;;
     --lag)         LAG="$2"; shift 2;;
+    --note)        NOTE="$2"; shift 2;;
     --) shift; CMD=("$@"); break;;
     -h|--help) usage;;
     *) echo "unknown arg: $1" >&2; usage;;
@@ -129,7 +134,51 @@ else
 fi
 mark "collector_start"
 
-finalize() {   # 写 run_meta.json（幂等：已存在就不重写）—— 信号中断(Ctrl-C)也能收尾
+json_escape() {   # 转义字符串使其能安全放进 JSON 双引号里（\ " 换行 制表）
+  local s="$1"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+write_run_readme() {   # runs/<id>/README.md —— 单 run 详情（note 放最前，方便分类阅读）
+  local mode; mode="$([[ ${#CMD[@]} -gt 0 ]] && echo wrap || echo attach)"
+  {
+    echo "# run $RUN_ID"
+    echo
+    [[ -n "$NOTE" ]] && { echo "$NOTE"; echo; }
+    echo "## meta"
+    echo "- **host**: $(uname -n)"
+    echo "- **backend**: $BACKEND"
+    if [[ "$BACKEND" == "dcgm" ]]; then
+      echo "- **gpus**: $GPUS"
+      echo "- **fields**: $FIELDS ($FIELD_IDS)"
+    else
+      echo "- **sw_config**: $SW_CONFIG (level=$SW_LEVEL fields=$SW_FIELDS switches=$SW_SWITCHES$([[ "$SW_RAW_BOOL" == true ]] && echo ' raw'))"
+    fi
+    echo "- **interval_ms**: $INTERVAL"
+    echo "- **mode**: $mode"
+    [[ ${#CMD[@]} -gt 0 ]] && echo "- **cmd**: \`${CMD[*]}\`"
+  } > "$RUNDIR/README.md"
+  return 0   # 上面 [[ ]] && echo 在 attach 模式返回非零，别让 set -e 中断 finalize
+}
+
+append_index() {   # runs/README.md —— 总索引，每个 run 追加一行（最新在下）
+  local idx="$OUTDIR/README.md" n
+  if [[ ! -f "$idx" ]]; then
+    {
+      echo "# runs 索引"
+      echo
+      echo "每次采集一行（最新在下）。详情见各 run 目录的 README.md。"
+      echo
+      echo "| run | backend | note |"
+      echo "|---|---|---|"
+    } > "$idx"
+  fi
+  n="${NOTE//$'\n'/ }"; n="${n//|/\\|}"; [[ -z "$n" ]] && n="—"   # 换行→空格、转义表格分隔符
+  printf '| [%s](%s/README.md) | %s | %s |\n' "$RUN_ID" "$RUN_ID" "$BACKEND" "$n" >> "$idx"
+}
+
+finalize() {   # 写 run_meta.json + 两个 README（幂等：已存在就不重写）—— 信号中断(Ctrl-C)也能收尾
   [[ -f "$RUNDIR/run_meta.json" ]] && return 0
   local backend_meta
   if [[ "$BACKEND" == "dcgm" ]]; then
@@ -145,9 +194,12 @@ finalize() {   # 写 run_meta.json（幂等：已存在就不重写）—— 信
   $backend_meta,
   "interval_ms": $INTERVAL,
   "mode": "$([[ ${#CMD[@]} -gt 0 ]] && echo wrap || echo attach)",
+  "note": "$(json_escape "$NOTE")",
   "workload_rc": $RC
 }
 EOF
+  write_run_readme
+  append_index
 }
 
 cleanup() {    # 幂等：停采集 + 收尾；正常结束与信号退出(EXIT trap)都走这

@@ -121,9 +121,9 @@ NVML 由轮询间隔定），**不是** kernel 级、微秒级的执行轨迹。
 | 目标 | 推荐字段 (id) | 选择理由（一句话）| 详见 |
 |---|---|---|---|
 | **HBM 带宽利用率/trace** | `dram_active` (1005) | 唯一的 HBM 带宽利用率信号；profiling，需 SYS_ADMIN | §5.1 |
-| **NVLink 带宽（聚合，一个数）** | `nvlink_bandwidth_total` (449) | device 字段、MB/s 直读、大概率免 SYS_ADMIN、无需差分 | §5.2 |
+| **NVLink 带宽（聚合，一个数）** | `nvlink_bandwidth_total` (449) | device 字段、直读无需差分、大概率免 SYS_ADMIN；**单位 MiB/s**（§5.2.1）| §5.2 |
 | **NVLink 带宽（tx/rx 拆分）** | `nvlink_tx_bytes`(1011)/`nvlink_rx_bytes`(1012) | 要方向拆分用它（profiling，需 SYS_ADMIN）；NVML `NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX/RX` 可交叉校验 | §5.2 |
-| **NVLink 带宽（每链路）** | `nvlink_bandwidth_lN`(440–449) 或 `nvlink_lN_tx/rx_bytes`(1040+) | 看单链路热点；device 版(440–449, MB/s) 免权限直读 | §5.2 |
+| **NVLink 带宽（每链路）** | `nvlink_bandwidth_lN`(440–449) 或 `nvlink_lN_tx/rx_bytes`(1040+) | 看单链路热点；device 版(440–449) 免权限直读，**单位未单独标定**（大概率同 449 的 MiB/s，§5.2.1）| §5.2 |
 | **SM 利用率（用了多少 SM）** | `sm_active` (1002) | ≠ nvidia-smi 的 GPU-Util | §5.4 |
 | **SM 占用深度** | `sm_occupancy` (1003) | 驻留 warp 数/硬件上限，看"忙到多满" | §5.4 |
 | Tensor Core 活跃 | `tensor_active`(1004)、`*_hmma/imma/dfma`(1013-1015) | Tensor 管线活跃占比 | §5.4 |
@@ -303,24 +303,103 @@ DCGM Field Ids（同 §1 链接）。
 
 - **DCGM device 路**（★负载实测可用，最省事、大概率免权限）：
   - 字段：`nvlink_bandwidth_total`(449) 聚合，或 `nvlink_bandwidth_lN`(440–449) 每链路。
-  - 语义：**直接给带宽 MB/s（已是速率，无需差分）**，聚合为**双向合计**，无 tx/rx 拆分。
+  - 语义：**已是速率、无需差分**，聚合为**双向合计**，无 tx/rx 拆分；数的是 **payload（不含协议开销）**。
+  - ⚠️ **单位是 MiB/s，不是 MB/s**（dmon 表头印 `MB/`）：`GB/s = 印出值 × 1048576 ÷ 1e9`。
+    照 `÷1000` 算会**系统性低 4.63%**。实测标定见 §5.2.1。
   - 属 **device 字段（id<1000，非 profiling）** → **大概率免 `--cap-add SYS_ADMIN`**（容器内待最终确认）。
-  - 负载实测：~388 GB/s（卡间 D2D 实验，`experiments/cumemcpy/logs/freq1/dcgmi_dmon_copy_d2d_inter.txt`）。
-- **NVML 路**（轻量、无需额外权限，作交叉校验）：
-  - 字段：`NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX/RX`、`..._RAW_TX/RX`，经 `nvmlDeviceGetFieldValues`
-    读取（旧的 `nvmlDeviceGetNvLinkUtilizationCounter` 已废弃）。
-  - 语义：**累计字节计数器**（KiB 级），要自己按轮询间隔**差分**得区间带宽；`scopeId` 携带 link id。
+  - 负载实测：单向 peer-copy **~405 GB/s**（`experiments/nvlink_bench/logs/dcgmi_dmon_449_steady_67.txt`）。
+- **NVML 路**（轻量、无需额外权限；**有 DCGM 拿不到的东西**）：
+  - 字段：`NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX/RX`(138/139)、`..._RAW_TX/RX`(140/141)，
+    经 `nvmlDeviceGetFieldValues` 读取（旧的 `nvmlDeviceGetNvLinkUtilizationCounter` 已废弃）。
+    `scopeId` = link id，`0xFFFFFFFF` = 整卡所有链路。
+  - 语义：**累计字节计数器**，要自己按轮询间隔**差分**得区间带宽。
+    **一格 = 1024 bytes（实测精确，见 §5.2.1）**，与 `nvml.h` 注释的 KiB 一致。
+  - ★ **`RAW` 是 DCGM 完全没暴露的一对**：`nvml.h` 注 *"Data + protocol overhead"*，
+    而 `DATA` 只有 payload。⇒ **`RAW ÷ DATA` = 协议开销比例，绝对字节口径，不依赖任何峰值假设**。
+    本机 DMA 实测 **1.0635（开销 6.35%）** —— 这是目前唯一能直接量协议开销的路子。
   - 参考：NVML NvLink 组 <https://docs.nvidia.com/deploy/archive/R510/nvml-api/group__NvLink.html>。
 - **DCGM profiling 路**（tx/rx 拆分，与其它 profiling 字段统一采集）：
   - 字段：`nvlink_tx_bytes`(1011)/`nvlink_rx_bytes`(1012) 聚合，或 `nvlink_lN_*`(1040+) 每链路。
-  - 语义：DCGM 已按采样区间给出 **bytes/秒 速率**（无需差分，含 header+payload）；单链路带宽 = RX+TX。
+  - 语义：DCGM 已按采样区间给出 **bytes/秒 速率**（无需差分）；单链路带宽 = RX+TX。
+  - ⚠️ **数的是 payload、不含协议开销**（与 449 同口径）。判据：SM 远程读时 `NVLTX=0`
+    （读请求包走 TX 但零数据字节）；同一负载程序自测 408 / 读到 405.2，含协议应为 434。
   - 属 profiling 字段 → 容器内采集需 `--cap-add SYS_ADMIN`（§4）。
 
 选择建议：
-- **主看总带宽 + 想少权限** → `nvlink_bandwidth_total`(449)（device，MB/s 直读，大概率免 SYS_ADMIN）。
+- **主看总带宽 + 想少权限** → `nvlink_bandwidth_total`(449)（device，直读，大概率免 SYS_ADMIN；单位 MiB/s，§5.2.1）。
 - **要 tx/rx 方向拆分** → profiling `nvlink_tx/rx_bytes`(1011/1012)（需 SYS_ADMIN）。反正 HBM/SM 也要 profiling，一把梭。
-- NVML 的 NVLink 计数器留作**交叉校验**；三者可并采，实测自洽（449 ≈ 1011+1012，device 口径与 profiling 略差 ~5%，正常）。
+- NVML 的 NVLink 计数器留作**交叉校验**，且 `RAW` 那对是 DCGM 拿不到的（协议开销）。
+  三者可并采，单位换对之后**实测自洽到 0.05%**（449×1048576/1e9 = 405.4 ⟷ 1011+1012 = 405.2）。
 - NVLink 属**片间**互联，不是"片上网络"（片上 NoC 见 §5.4）。
+
+#### 5.2.1 三条路的单位标定（实测，换机器要重标）
+
+标定脚本 `experiments/nvlink_bench/workloads/nvml_counter_units.py`（容器内跑，两张空卡）：
+`calib` 搬定量字节前后各读一次计数器 → 定"一格几字节"；`sustain` 自差分 → 和宿主机 `dcgmi dmon` 对照。
+
+| 事实 | 数值 | 怎么得到的 |
+|---|---|---|
+| NVML `DATA_TX` 一格 | **1024 bytes**（精确）| 搬 42,949,672,960 B，计数器涨 41,943,040 格 → `1024.000` |
+| NVML `DATA_TX` 差分 ÷ 程序自测 | **1.0000** | `sustain` 模式，计数器本身无偏 |
+| DCGM 449 印出值的单位 | **MiB/s** | 真值 405.2 GB/s → 应印 386,400，实测印 **386,586**（+0.05%）；若按 `KiB/s÷1000` 该印 395,674（−2.3%）|
+| NVML `RAW_TX ÷ DATA_TX`（DMA）| **1.0635** | calib 与 sustain 两种模式一致到 5 位 |
+
+⚠️ **DCGM 源码与本机 binary 在这里不一致，如实记录**：`dcgmlib/src/DcgmCacheManager.cpp` 的
+`ReadAndCacheNvLinkBandwidth()` 里那行是 `valueDbl /= 1000.0;  /* Convert to KiB/sec -> MiB/sec */`
+（v4.2.3 与 v4.6.0 两个 tag 都写 1000）—— **注释是对的**（KiB→MiB 该除 1024），**代码写的 1000
+与本机 4.2.3 binary 的实际行为不符**。所以上表是**实测标定**、不是源码推导。
+`dcgm_fields.cpp` 注册的 `DCGM_FIELD_UNIT_BW_MBPS` 只是显示标签，链路上再无其它缩放。
+
+复现性：GPU 6↔7（2026-07-31）与 GPU 2↔3（2026-07-23）同一负载**逐位一致**
+（449 原始 386586 vs 386587；1011 405.17 vs 405.20）。
+
+#### 5.2.2 链路速率（**不是吞吐**）：NVML `NVLINK_GET_SPEED`(164) = 26562 MBps/link ★
+
+前面三条路数的都是"实际搬了多少"；这一条是"这条链路每秒**能**搬多少"，即
+`nvidia-smi nvlink --status` 印出来的那个数。它是**唯一一个能从本机拿到链路速率的字段**。
+
+| 字段 | id | 本机结果 |
+|---|---|---|
+| `NVML_FI_DEV_NVLINK_SPEED_MBPS_L0..L11` | 84–89 / 132–137 | ❌ **全部 `rc=3` NOT_SUPPORTED** |
+| `NVML_FI_DEV_NVLINK_SPEED_MBPS_COMMON` | 90 | ❌ **`rc=3` NOT_SUPPORTED** |
+| **`NVML_FI_DEV_NVLINK_GET_SPEED`** | **164** | ✅ `scopeId` = link id，18 条**全部 raw = 26562** |
+
+⇒ 想读链路速率**必须用 164 并逐链路给 scopeId**；那组名字更直白的 `SPEED_MBPS_L*` 在 H100 上是死的。
+`nvidia-smi nvlink --status -i 0` 印的 18 行 `26.562 GB/s` 就是它 ÷1000。
+**整卡单方向 = 18 × 26562 MBps = 478.116 GB/s**。
+
+⚠️ **单位陷阱：164 是十进制 MBps，和前面那些吞吐计数器不是一套单位** ——
+同一个 NVML/DCGM 生态里，`THROUGHPUT_*` 计数器是**二进制**（一格 1024 B，449 印出来是 MiB/s，§5.2.1），
+而 164 是**十进制**（÷1000 得 GB/s）。依据：若按二进制读，18 × 26562 MiB/s = **501.3 GB/s**，
+与 `experiments/nvlink_bench` 用已知带宽负载反推的 476.9–478.1（11 行，散度 0.25%）差 4.8%；
+按十进制读得 478.116，落在反推区间里。**别看见 "MBps" 就统一按一种进制换算。**
+
+补两条实测事实：
+
+- raw 是**整数** 26562，表达不了小数位；`nvidia-smi` 印 `26.562`。
+- `nvmlDeviceGetNvLinkVersion()` 在本机 H100 上返回 **6**，**不是**市场名的 "NVLink 4.0"。
+  这是 NVML 自己的协议版本号，**别拿它当代际号用**。
+
+复现（只读，不占显存，任意一张卡）：
+
+```bash
+cd experiments/nvlink_bench
+docker run --rm --gpus '"device=6"' -v "$PWD/workloads":/w -w /w \
+  nvcr.io/nvidia/pytorch:25.12-py3 python /w/nvml_link_speed.py
+```
+
+> 这个 478.116 与 NVIDIA 官方规格 450 GB/s/方向（18×25）之间差 6.25%，以及"哪个数该当哪个计数器的
+> 百分比分母"，是单独一件事 —— 论证、四组合拟合表和实测证据在
+> `experiments/nvlink_bench/BANDWIDTH_CEILING.md`，待拍板项在 `PLAN.md §3`。
+> **本节只记录"字段报了什么、单位怎么读"这个 ground truth，不在这里定分母。**
+
+**NVLink 画绝对带宽，不画利用率%**：本仓库**不给 NVLink 的峰值分母定数**，所以 `tool/metrics.py`
+的面板是 `nvlink bw (GB/s bidir)`、`parse` 速览也只报 GB/s。换算只有单位换算这一步：
+- 方向拆分 `nvlink_tx_bytes`/`nvlink_rx_bytes`(1011/1012)：**bytes/s** ÷ 1e9 = GB/s。
+- 总量 `nvlink_bandwidth_total`(449)：**MiB/s**（dmon 表头印 `MB/`）→ **× 1048576 ÷ 1e9 = GB/s**，
+  **它本身就是双向合计**。⚠️ 按表头当 MB/s 除 1000 会低 **4.63%**，标定见 §5.2.1。
+- ⚠️ 单向负载下"双向合计"天然只有一个方向在跑（NVLink 全双工）—— 比饱和度要按方向看 tx/rx，
+  别拿双向合计的数去和单向的数比。
 
 **NVSwitch（本机 NVLink-switched 节点，4 颗物理 NVSwitch + Fabric Manager active；`dcgmi discovery -l` 报"12"是逻辑口径）**，每 GPU 18 条 NVLink 全接到 NVSwitch。路由：
 - **测"我的程序用了多少 NVLink 带宽"→ 仍看 GPU 侧 `nvlink_tx/rx_bytes`(1011/1012)+`449`**（该 GPU 到 switch 的收发流量，应用视角，主用路径不变）。
@@ -418,12 +497,13 @@ DCGM Field Ids（同 §1 链接）。
 
 | 字段 (id) | 短名 | idle | **负载下实测** | 说明 |
 |---|---|---|---|---|
-| `nvlink_bandwidth_total` (449) | NBWLT | 0 | **~388 GB/s** | **device 字段(非 profiling)**；聚合双向带宽，MB/s，已是速率，无 tx/rx 之分 |
-| `nvlink_bandwidth_l0..` (440–448) | NBWLx | 0 | per-link | per-link 版，同为 device 字段、MB/s 速率 |
+| `nvlink_bandwidth_total` (449) | NBWLT | 0 | **~405 GB/s** | **device 字段(非 profiling)**；聚合双向带宽，已是速率，无 tx/rx 之分。**单位 MiB/s**，`× 1048576 ÷ 1e9` 才是 GB/s（§5.2.1）|
+| `nvlink_bandwidth_l0..` (440–448) | NBWLx | 0 | per-link | per-link 版，同为 device 字段、速率（单位未单独标定，大概率同 449）|
 | `nvlink_tx_bytes` (1011) | NVLTX | 0 | **源卡 ~406 GB/s**（目的卡 0）| **profiling(需 SYS_ADMIN)**；tx 单向 |
 | `nvlink_rx_bytes` (1012) | NVLRX | 0 | **目的卡 ~406 GB/s**（源卡 0）| profiling；rx 单向 |
 
-自洽：源卡 NVLTX≈406、RX≈0；同卡 449(双向聚合)≈388 ≈ NVLTX，同量级。
+自洽：源卡 NVLTX≈406、RX≈0；同卡 449(双向聚合，换算后)≈405 ≈ NVLTX，**吻合 0.05%**。
+⚠️ 若照 dmon 表头把 449 当 MB/s 除 1000，会读到 ~388 而以为它"比 profiling 低 5%"——那是单位，不是精度（§5.2.1）。
 > ⚠️ 教训：3s idle 测试曾把 449/440 误判"不可用"。**device 计数器 idle=0 是正常的，必须负载实测才能定性**（已修正）。
 
 ### 7.3 能采到、但易被误用
@@ -484,3 +564,27 @@ DCGM Field Ids（同 §1 链接）。
   `-d 100` 负载下实测稳定 ~100ms；`-d<100` 不会更快，`-d≥100` 按 `-d` 出拍、dt 按真实墙钟算、速率正确。
 - 对照第一部分 §3.1：**GPM 的地板是"计数器刷新率"，这条是"读延迟"**，结论都 ~100ms、机制不同。无官方文档规定 NSCQ 刷新率
   （未公开的 stable API），以上为本机实测。
+
+## 11. 坑：掉卡 / down-link 会污染端口计数器 → 间歇打印巨大假尖峰（实测）
+**现象**：当某 GPU 掉卡（`nvidia-smi` 少一张）、其一条 NVLink down 后，`nvswitch_traffic` 会**隔几拍在该 down-link
+所在的 (switch, port) 打印一个极大值**（本机实测 ~4.2e11 GB/s 量级），其余拍为 0。这是**掉卡产生的假值，不是真实流量**，
+也不是工具正常逻辑的 bug。
+
+**机理**（本机实测证据链）：
+- down-link 的端口**仍被 NSCQ 枚举**（记录数 256 不变 → 工具"端口数变化才重建"的守卫不触发）。
+- 对这条口，`nscq_session_path_observe` **返回 `rc=NSCQ_RC_SUCCESS`（rc=0），但 `throughput_counters` 无效**：
+  其绝对值在"正常低值 ↔ 一个**固定垃圾常量**"之间来回跳（本机测得该常量 `1643747071612666` = `0x0005d6fab04dd6fa`，
+  且 **rx 与 tx 完全相等**——真实流量几乎不可能逐比特相等，可作脏数据信号）。
+- 工具按 `delta = cur − prev` 差分：`cur=垃圾, prev=正常` 那拍 → delta ≈ 1.6e15 Mibits → 巨大尖峰；下一拍
+  `cur=正常, prev=垃圾`（cur<prev）→ `delta()` 的"计数器倒退归 0"守卫生效 → 打印 0。**一冒一停**即"隔一段时间冒一次"。
+
+**当前工具无防护**：`tput_cb` 信任 `rc=SUCCESS`、不对单次读到的累计计数器做量级 sanity check；`delta()` 只挡"倒退"、
+挡不住"暴涨"。识别信号：单口速率**大到不可能**（比同一负载下 GPU 侧 NVLink 计数器高一个量级以上）、且 **rx==tx**。
+
+**复现 / 定位**（用已发布工具，raw 模式看每端口 Δ）：
+```bash
+tool/nvswitch_traffic/nvswitch_traffic -l port -i <sw> -r -e total -d 500 -c 12   # 异常端口那列会周期性出现固定大 Δ
+```
+本机观测实例（2026-07-23，GPU-7 掉卡）：假尖峰落在 **switch 2 / port 58**（该 down-link 对应端口），
+Δtotal 恒为 `3287494143225332` Mibits（= 2×上述常量）。rc=SUCCESS + 绝对计数器的确认，用一段只读 NSCQ 探针
+（打印 per-port `rc` 与绝对 `rx/tx`）验证；工具原码未改。

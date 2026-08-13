@@ -1,0 +1,322 @@
+schema_version: 1
+suite: ThunderKittens-ProfilingTable-H100-P0
+source_csv: ~/Repos/ThunderKittens-ProfilingTable-H100.csv
+thunderkittens_commit: 0b3f192dd4277a246c583c0a3e606258de8dbfe0
+expected_case_count: 16
+iteration_policy: {warmup_iters: 10, native_iters: 20, profile_iters: 1000000000}
+profiling_defaults:
+  devices: "0,1,2,3,4,5,6,7"
+  nsys_gpus: "0"
+  nsys_duration_s: 0.2
+  nsys_frequency_hz: 100000
+  nsys_start_delay_s: 30
+  dcgm_duration_s: 5
+moe_variant_root: scripts/thunderkittens/moe_variants
+
+groups:
+  p0:
+    TK002:
+      case_id: TK002
+      priority: P0
+      importance: 64
+      phase: Decode
+      model: Seed-OSS-36B
+      model_type: Dense GQA+SwiGLU
+      transformer_stage: Fused QKV input projection
+      family: AG
+      world_size: 8
+      runner: kernels/parallel/ag_gemm/benchmark.py
+      entrypoint: _C.all_gather_matmul
+      target_kernel: main_kernel
+      source_path: kernels/parallel/ag_gemm/ag_gemm_h100.cu
+      logical: {B: 8, S: 1, M: 8, N: 1536, K: 5120}
+      execution: {M: 2048, N: 1536, K: 5120}
+      runtime: {num_comm_sms: 8}
+      exactness: Exact GEMM shape; padded M
+      source_compatible: true
+    TK005:
+      case_id: TK005
+      priority: P0
+      importance: 64
+      phase: Decode
+      model: Seed-OSS-36B
+      model_type: Dense GQA+SwiGLU
+      transformer_stage: Attention output projection
+      family: RS
+      world_size: 8
+      runner: kernels/parallel/gemm_rs/benchmark.py
+      entrypoint: _C.matmul_reduce_scatter
+      target_kernel: "matmul_reduce_scatter::kernel"
+      source_path: kernels/parallel/gemm_rs/gemm_rs_h100.cu
+      logical: {B: 8, S: 1, M: 8, N: 5120, K: 1280}
+      execution: {M: 1024, N: 5120, K: 1280}
+      exactness: Exact GEMM shape; padded M
+      source_compatible: true
+    TK006:
+      case_id: TK006
+      priority: P0
+      importance: 64
+      phase: Decode
+      model: Seed-OSS-36B
+      model_type: Dense GQA+SwiGLU
+      transformer_stage: Dense SwiGLU gate+up projection
+      family: AG
+      world_size: 8
+      runner: kernels/parallel/ag_gemm/benchmark.py
+      entrypoint: _C.all_gather_matmul
+      target_kernel: main_kernel
+      source_path: kernels/parallel/ag_gemm/ag_gemm_h100.cu
+      logical: {B: 8, S: 1, M: 8, N: 6912, K: 5120}
+      execution: {M: 2048, N: 6912, K: 5120}
+      runtime: {num_comm_sms: 8}
+      exactness: Exact GEMM shape; padded M
+      source_compatible: true
+    TK007:
+      case_id: TK007
+      priority: P0
+      importance: 64
+      phase: Decode
+      model: Seed-OSS-36B
+      model_type: Dense GQA+SwiGLU
+      transformer_stage: Dense SwiGLU down projection
+      family: RS
+      world_size: 8
+      runner: kernels/parallel/gemm_rs/benchmark.py
+      entrypoint: _C.matmul_reduce_scatter
+      target_kernel: "matmul_reduce_scatter::kernel"
+      source_path: kernels/parallel/gemm_rs/gemm_rs_h100.cu
+      logical: {B: 8, S: 1, M: 8, N: 5120, K: 3456}
+      execution: {M: 1024, N: 5120, K: 3584}
+      exactness: K padded to kernel stage alignment; M padded
+      source_compatible: true
+    TK022:
+      case_id: TK022
+      priority: P0
+      importance: 48
+      phase: Decode
+      model: Qwen3-30B-A3B
+      model_type: MoE GQA
+      transformer_stage: Fused QKV input projection
+      family: AG
+      world_size: 8
+      runner: kernels/parallel/ag_gemm/benchmark.py
+      entrypoint: _C.all_gather_matmul
+      target_kernel: main_kernel
+      source_path: kernels/parallel/ag_gemm/ag_gemm_h100.cu
+      logical: {B: 8, S: 1, M: 8, N: 640, K: 2048}
+      execution: {M: 2048, N: 768, K: 2048}
+      runtime: {num_comm_sms: 8}
+      exactness: N padded + M padded
+      source_compatible: true
+    TK025:
+      case_id: TK025
+      priority: P0
+      importance: 48
+      phase: Decode
+      model: Qwen3-30B-A3B
+      model_type: MoE GQA
+      transformer_stage: Attention output projection
+      family: RS
+      world_size: 8
+      runner: kernels/parallel/gemm_rs/benchmark.py
+      entrypoint: _C.matmul_reduce_scatter
+      target_kernel: "matmul_reduce_scatter::kernel"
+      source_path: kernels/parallel/gemm_rs/gemm_rs_h100.cu
+      logical: {B: 8, S: 1, M: 8, N: 2048, K: 512}
+      execution: {M: 1024, N: 2048, K: 512}
+      exactness: Exact GEMM shape; padded M
+      source_compatible: true
+    TK026:
+      case_id: TK026
+      priority: P0
+      importance: 48
+      phase: Decode
+      model: Qwen3-30B-A3B
+      model_type: MoE GQA
+      transformer_stage: MoE dispatch + expert H→I projection
+      family: MoE
+      world_size: 8
+      runner: kernels/parallel/moe_dispatch_gemm/benchmark.py
+      entrypoint: _C.moe_dispatch_gemm
+      target_kernel: dispatch_group_gemm_kernel
+      source_path: kernels/parallel/moe_dispatch_gemm/moe_dispatch_gemm_h100.cu
+      logical: {B: 8, S: 1, M: 8, N: 768, K: 2048, routed_per_expert: 0.5}
+      execution: {B: 8, S: 1, M: 8, N: 768, K: 2048, H: 2048, I: 768, experts: 128, top_k: 8, routed_per_expert: 128}
+      runtime: {num_comm_sms: 28}
+      exactness: Kernel de-hardcode; expert rows padded
+      source_compatible: false
+      source_requirement: Compile H=2048 I=768 TOP_K=8 NUM_EXPERTS=128 variant
+    TK034:
+      case_id: TK034
+      priority: P0
+      importance: 48
+      phase: Prefill
+      model: Qwen3-30B-A3B
+      model_type: MoE GQA
+      transformer_stage: MoE dispatch + expert H→I projection
+      family: MoE
+      world_size: 8
+      runner: kernels/parallel/moe_dispatch_gemm/benchmark.py
+      entrypoint: _C.moe_dispatch_gemm
+      target_kernel: dispatch_group_gemm_kernel
+      source_path: kernels/parallel/moe_dispatch_gemm/moe_dispatch_gemm_h100.cu
+      logical: {B: 8, S: 1024, M: 8192, N: 768, K: 2048, routed_per_expert: 512}
+      execution: {B: 8, S: 1024, M: 8192, N: 768, K: 2048, H: 2048, I: 768, experts: 128, top_k: 8, routed_per_expert: 512}
+      runtime: {num_comm_sms: 28}
+      exactness: Kernel de-hardcode
+      source_compatible: false
+      source_requirement: Compile H=2048 I=768 TOP_K=8 NUM_EXPERTS=128 variant
+    TK041:
+      case_id: TK041
+      priority: P0
+      importance: 43
+      phase: Decode
+      model: DeepSeek-V4-Flash
+      model_type: MoE CSA/HCA + mHC
+      transformer_stage: Representative CSA/HCA O-A input projection
+      family: AG
+      world_size: 8
+      runner: kernels/parallel/ag_gemm/benchmark.py
+      entrypoint: _C.all_gather_matmul
+      target_kernel: main_kernel
+      source_path: kernels/parallel/ag_gemm/ag_gemm_h100.cu
+      logical: {B: 8, S: 1, M: 8, N: 1024, K: 4096}
+      execution: {M: 2048, N: 1024, K: 4096}
+      runtime: {num_comm_sms: 8}
+      exactness: Representative projection; M padded
+      source_compatible: true
+    TK042:
+      case_id: TK042
+      priority: P0
+      importance: 43
+      phase: Decode
+      model: DeepSeek-V4-Flash
+      model_type: MoE CSA/HCA + mHC
+      transformer_stage: Representative CSA/HCA output projection
+      family: RS
+      world_size: 8
+      runner: kernels/parallel/gemm_rs/benchmark.py
+      entrypoint: _C.matmul_reduce_scatter
+      target_kernel: "matmul_reduce_scatter::kernel"
+      source_path: kernels/parallel/gemm_rs/gemm_rs_h100.cu
+      logical: {B: 8, S: 1, M: 8, N: 4096, K: 1024}
+      execution: {M: 1024, N: 4096, K: 1024}
+      exactness: Representative projection; M padded
+      source_compatible: true
+    TK043:
+      case_id: TK043
+      priority: P0
+      importance: 43
+      phase: Decode
+      model: DeepSeek-V4-Flash
+      model_type: MoE CSA/HCA + mHC
+      transformer_stage: MoE dispatch + expert H→I projection
+      family: MoE
+      world_size: 8
+      runner: kernels/parallel/moe_dispatch_gemm/benchmark.py
+      entrypoint: _C.moe_dispatch_gemm
+      target_kernel: dispatch_group_gemm_kernel
+      source_path: kernels/parallel/moe_dispatch_gemm/moe_dispatch_gemm_h100.cu
+      logical: {B: 8, S: 1, M: 8, N: 2048, K: 4096, routed_per_expert: 0.1875}
+      execution: {B: 8, S: 1, M: 8, N: 2048, K: 4096, H: 4096, I: 2048, experts: 256, top_k: 6, routed_per_expert: 128}
+      runtime: {num_comm_sms: 28}
+      exactness: Kernel de-hardcode; expert rows padded
+      source_compatible: false
+      source_requirement: Compile H=4096 I=2048 TOP_K=6 NUM_EXPERTS=256 variant
+    TK048:
+      case_id: TK048
+      priority: P0
+      importance: 43
+      phase: Prefill
+      model: DeepSeek-V4-Flash
+      model_type: MoE CSA/HCA + mHC
+      transformer_stage: MoE dispatch + expert H→I projection
+      family: MoE
+      world_size: 8
+      runner: kernels/parallel/moe_dispatch_gemm/benchmark.py
+      entrypoint: _C.moe_dispatch_gemm
+      target_kernel: dispatch_group_gemm_kernel
+      source_path: kernels/parallel/moe_dispatch_gemm/moe_dispatch_gemm_h100.cu
+      logical: {B: 8, S: 1024, M: 8192, N: 2048, K: 4096, routed_per_expert: 192}
+      execution: {B: 8, S: 1024, M: 8192, N: 2048, K: 4096, H: 4096, I: 2048, experts: 256, top_k: 6, routed_per_expert: 256}
+      runtime: {num_comm_sms: 28}
+      exactness: Kernel de-hardcode; expert rows padded
+      source_compatible: false
+      source_requirement: Compile H=4096 I=2048 TOP_K=6 NUM_EXPERTS=256 variant
+    TK052:
+      case_id: TK052
+      priority: P0
+      importance: 94
+      phase: Decode
+      model: Qwen3-235B-A22B
+      model_type: MoE GQA
+      transformer_stage: Fused QKV input projection
+      family: AG
+      world_size: 8
+      runner: kernels/parallel/ag_gemm/benchmark.py
+      entrypoint: _C.all_gather_matmul
+      target_kernel: main_kernel
+      source_path: kernels/parallel/ag_gemm/ag_gemm_h100.cu
+      logical: {B: 8, S: 1, M: 8, N: 1152, K: 4096}
+      execution: {M: 2048, N: 1280, K: 4096}
+      runtime: {num_comm_sms: 8}
+      exactness: N padded + M padded
+      source_compatible: true
+    TK055:
+      case_id: TK055
+      priority: P0
+      importance: 94
+      phase: Decode
+      model: Qwen3-235B-A22B
+      model_type: MoE GQA
+      transformer_stage: Attention output projection
+      family: RS
+      world_size: 8
+      runner: kernels/parallel/gemm_rs/benchmark.py
+      entrypoint: _C.matmul_reduce_scatter
+      target_kernel: "matmul_reduce_scatter::kernel"
+      source_path: kernels/parallel/gemm_rs/gemm_rs_h100.cu
+      logical: {B: 8, S: 1, M: 8, N: 4096, K: 1024}
+      execution: {M: 1024, N: 4096, K: 1024}
+      exactness: Exact GEMM shape; padded M
+      source_compatible: true
+    TK056:
+      case_id: TK056
+      priority: P0
+      importance: 94
+      phase: Decode
+      model: Qwen3-235B-A22B
+      model_type: MoE GQA
+      transformer_stage: MoE dispatch + expert H→I projection
+      family: MoE
+      world_size: 8
+      runner: kernels/parallel/moe_dispatch_gemm/benchmark.py
+      entrypoint: _C.moe_dispatch_gemm
+      target_kernel: dispatch_group_gemm_kernel
+      source_path: kernels/parallel/moe_dispatch_gemm/moe_dispatch_gemm_h100.cu
+      logical: {B: 8, S: 1, M: 8, N: 1536, K: 4096, routed_per_expert: 0.5}
+      execution: {B: 8, S: 1, M: 8, N: 1536, K: 4096, H: 4096, I: 1536, experts: 128, top_k: 8, routed_per_expert: 128}
+      runtime: {num_comm_sms: 28}
+      exactness: Kernel de-hardcode; expert rows padded
+      source_compatible: false
+      source_requirement: Compile H=4096 I=1536 TOP_K=8 NUM_EXPERTS=128 variant
+    TK064:
+      case_id: TK064
+      priority: P0
+      importance: 94
+      phase: Prefill
+      model: Qwen3-235B-A22B
+      model_type: MoE GQA
+      transformer_stage: MoE dispatch + expert H→I projection
+      family: MoE
+      world_size: 8
+      runner: kernels/parallel/moe_dispatch_gemm/benchmark.py
+      entrypoint: _C.moe_dispatch_gemm
+      target_kernel: dispatch_group_gemm_kernel
+      source_path: kernels/parallel/moe_dispatch_gemm/moe_dispatch_gemm_h100.cu
+      logical: {B: 8, S: 1024, M: 8192, N: 1536, K: 4096, routed_per_expert: 512}
+      execution: {B: 8, S: 1024, M: 8192, N: 1536, K: 4096, H: 4096, I: 1536, experts: 128, top_k: 8, routed_per_expert: 512}
+      runtime: {num_comm_sms: 28}
+      exactness: Kernel de-hardcode
+      source_compatible: false
+      source_requirement: Compile H=4096 I=1536 TOP_K=8 NUM_EXPERTS=128 variant

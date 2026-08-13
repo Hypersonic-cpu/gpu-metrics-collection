@@ -2,13 +2,13 @@
 """metrics.py —— profile.sh 采集后处理（parse + plot 合一，两后端自适应）。
 
 按 run 的 backend 自动分派（读 run_meta.json 的 backend，缺则按文件名探测）：
-  dcgm      解析 dcgm_raw.log；plot -> plots/trace.png
-  nvswitch  解析 nvswitch.csv（本身即带 epoch 的规范数据）；plot -> plots/nvswitch_trace.png
+  dcgm      解析 dcgm_raw.log；plot -> trace.png（run 目录根下）
+  nvswitch  解析 nvswitch.csv（本身即带 epoch 的规范数据）；plot -> nvswitch_trace.png（run 目录根下）
 
 两个子命令：
   parse  原始日志 -> metrics.csv（dcgm）+ 控制台速览。纯 stdlib，宿主机直接跑：
          python3 tool/metrics.py parse runs/<id>
-  plot   -> plots/*.png（每 metric 一格、每实体一条线、叠加阶段 MARK 竖线）。
+  plot   -> <run>/*.png（trace.png / nvswitch_trace.png；每 metric 一格、每实体一条线、叠加阶段 MARK 竖线）。
          需 matplotlib -> 在容器里跑（宿主机 pip 会 OOM），容器无中文字体故图内一律英文；
          加 --user 让输出图归当前用户（否则 png 被容器 root 占，删改要 sudo）：
          docker run --rm --user "$(id -u):$(id -g)" -e MPLCONFIGDIR=/tmp/mpl \\
@@ -30,8 +30,9 @@ SHORT2NAME = {
     "MCUTL": "mem_copy_util", "FBUSD": "fb_used_MB",
 }
 
-# plot 画哪些 metric（按此顺序，每个一格）
-PLOT = ["dram_active", "nvlink_bw_total_MBps", "pcie_rx_bytes", "pcie_tx_bytes"]
+# NVLink 一律画/报**绝对带宽 GB/s**，不换算成"占峰值百分之几" —— 本仓库不给它的峰值分母定数。
+# 单位：nvlink_tx_bytes/nvlink_rx_bytes(1011/1012) = bytes/s；nvlink_bw_total_MBps(449) = MB/s，
+# 且 449 本身就是双向合计。
 
 
 def read_marks(path):
@@ -158,6 +159,29 @@ def cmd_parse(rundir):
         mn = f"{d['sum']/d['valid']:.4g}" if d["valid"] else "-"
         print(f"  {gpu:>4} {metric:<22} {str(d['valid'])+'/'+str(d['n']):>12} {mx:>16} {mn:>16}")
 
+    print_nvlink_bw(agg)
+
+
+def print_nvlink_bw(agg):
+    """据字段速览 agg 打印每 GPU 的 NVLink 峰值带宽（**绝对 GB/s，不给占峰值%**）。
+       优先方向 profiling(1011/1012)；缺则用聚合 449（它本身是双向合计）。"""
+    def gmax(gpu, metric):
+        return agg.get((gpu, metric), {}).get("max")
+
+    gpus = sorted({g for (g, _) in agg})
+    lines = []
+    for g in gpus:
+        tx, rx = gmax(g, "nvlink_tx_bytes"), gmax(g, "nvlink_rx_bytes")
+        bw = gmax(g, "nvlink_bw_total_MBps")           # 449：单位 MB/s
+        if tx is not None or rx is not None:            # 方向拆分（bytes/s -> GB/s）
+            lines.append(f"  GPU{g:>2}  tx {(tx or 0) / 1e9:6.1f} GB/s"
+                         f"   rx {(rx or 0) / 1e9:6.1f} GB/s")
+        elif bw is not None:                            # 只有聚合 449（MB/s，双向合计）
+            lines.append(f"  GPU{g:>2}  bw_total {bw / 1000:6.1f} GB/s (双向合计)")
+    if lines:
+        print("\nNVLink 带宽 (窗口内 max):")
+        print("\n".join(lines))
+
 
 def parse_nvswitch(rundir):
     """nvswitch.csv 速览（本身即规范数据，不再另写 metrics.csv）。"""
@@ -235,34 +259,77 @@ def cmd_plot(rundir):
 
     rows = list(csv.DictReader(open(os.path.join(rundir, "metrics.csv"))))
     gpus = sorted({r["gpu"] for r in rows})
+    present = {r["metric"] for r in rows}
     marks, _ = load_plot_marks(rundir)
 
-    fig, axes = plt.subplots(len(PLOT), 1, figsize=(11, 2.4 * len(PLOT)), sharex=True)
-    for ax, metric in zip(axes, PLOT):
-        for gpu in gpus:
+    # 每个面板 = 一个「(gpu) -> (xs, ys)」取序列函数（闭包 rows）。
+    def simple(metric, to_y):
+        """单 metric、逐点变换（bytes/MBps -> 想画的单位）。"""
+        def series(gpu):
             xs, ys = [], []
             for r in rows:
                 if r["metric"] == metric and r["gpu"] == gpu and r["t_rel"] != "":
                     try:
-                        ys.append(float(r["value"]))
+                        ys.append(to_y(float(r["value"])))
                         xs.append(float(r["t_rel"]))
                     except ValueError:
                         pass
+            return xs, ys
+        return series
+
+    def nvlink_bw(gpu):
+        """NVLink 双向合计带宽 GB/s（不换算成占峰值%）。
+           优先 449(MB/s，直接是双向聚合)；缺则按 t_rel join (tx+rx)/1e9。"""
+        if "nvlink_bw_total_MBps" in present:
+            return simple("nvlink_bw_total_MBps", lambda v: v / 1000)(gpu)
+        tx = {r["t_rel"]: r["value"] for r in rows
+              if r["metric"] == "nvlink_tx_bytes" and r["gpu"] == gpu and r["t_rel"] != ""}
+        rx = {r["t_rel"]: r["value"] for r in rows
+              if r["metric"] == "nvlink_rx_bytes" and r["gpu"] == gpu and r["t_rel"] != ""}
+        xs, ys = [], []
+        for t in sorted(tx.keys() & rx.keys(), key=float):
+            try:
+                ys.append((float(tx[t]) + float(rx[t])) / 1e9)
+                xs.append(float(t))
+            except ValueError:
+                pass
+        return xs, ys
+
+    # 面板顺序：HBM 利用率 → NVLink 带宽 → PCIe 收/发带宽。缺字段的面板自动跳过。
+    panels = []          # (ylabel, ylim|None, series_fn)
+    if "dram_active" in present:
+        panels.append(("dram_active\n(HBM util, 0-1)", (0, 1.0),
+                       simple("dram_active", lambda v: v)))
+    if "nvlink_bw_total_MBps" in present or {"nvlink_tx_bytes", "nvlink_rx_bytes"} <= present:
+        panels.append(("nvlink bw\n(GB/s bidir)", None, nvlink_bw))
+    for m, lab in (("pcie_rx_bytes", "pcie_rx\n(GB/s)"), ("pcie_tx_bytes", "pcie_tx\n(GB/s)")):
+        if m in present:
+            panels.append((lab, None, simple(m, lambda v: v / 1e9)))
+    if not panels:
+        print("no known metrics to plot（metrics.csv 里没有可识别字段）", file=sys.stderr)
+        return
+
+    fig, axes = plt.subplots(len(panels), 1, figsize=(11, 2.4 * len(panels)),
+                             sharex=True, squeeze=False)
+    axes = axes[:, 0]
+    for ax, (ylabel, ylim, series) in zip(axes, panels):
+        for gpu in gpus:
+            xs, ys = series(gpu)
             if xs:
                 ax.plot(xs, ys, marker=".", ms=3, label=f"GPU{gpu}")
+        if ylim:
+            ax.set_ylim(*ylim)         # 先定轴，MARK 文字才落在固定顶端
         for tr, lab in marks:
             ax.axvline(tr, color="grey", ls="--", lw=0.7, alpha=0.3)
             ax.text(tr, ax.get_ylim()[1], lab, rotation=90, va="top", ha="right",
                     fontsize=7, color="grey")
-        ax.set_ylabel(metric, fontsize=9)
+        ax.set_ylabel(ylabel, fontsize=9)
         ax.legend(fontsize=8, loc="upper right")
         ax.grid(alpha=0.3)
     axes[-1].set_xlabel("t_rel (s) since collector_start")
     fig.suptitle(f"GPU interface metrics trace — {os.path.basename(rundir.rstrip('/'))}")
     fig.tight_layout()
-    outdir = os.path.join(rundir, "plots")
-    os.makedirs(outdir, exist_ok=True)
-    out = os.path.join(outdir, "trace.png")
+    out = os.path.join(rundir, "trace.png")
     fig.savefig(out, dpi=110)
     print("saved", out)
 
@@ -319,9 +386,7 @@ def plot_nvswitch(rundir):
     axes[-1].set_xlabel("t_rel (s) since collector_start")
     fig.suptitle(f"NVSwitch traffic trace — {os.path.basename(rundir.rstrip('/'))}")
     fig.tight_layout()
-    outdir = os.path.join(rundir, "plots")
-    os.makedirs(outdir, exist_ok=True)
-    out = os.path.join(outdir, "nvswitch_trace.png")
+    out = os.path.join(rundir, "nvswitch_trace.png")
     fig.savefig(out, dpi=110)
     print("saved", out)
 

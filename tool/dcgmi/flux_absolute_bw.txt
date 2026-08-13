@@ -1,0 +1,9 @@
+# flux_absolute_bw — long-window DCGM bandwidth fields.
+#
+# 1005 is DRAM_BW_UTIL (0..1), so the postprocessor reports an HBM bandwidth
+# estimate using the host H100 HBM peak of 3352.32 GB/s. 449 is absolute
+# aggregate NVLink bandwidth in MiB/s; 1011/1012 are absolute TX/RX bytes/s.
+1005   # dram_active / HBM bandwidth utilization
+449    # nvlink_bandwidth_total / aggregate absolute NVLink bandwidth (MiB/s)
+1011   # nvlink_tx_bytes / absolute NVLink TX bytes/s
+1012   # nvlink_rx_bytes / absolute NVLink RX bytes/s

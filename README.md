@@ -9,14 +9,17 @@
 
 ---
 
-## 两类工具（都在 `tool/`）
+## 三类工具（都在 `tool/`）
 
 | 工具 | 采什么 | 怎么采 | 工具文档 |
 |---|---|---|---|
-| **① DCGM 采集**（主力）| HBM / SM / PCIe / GPU 侧 NVLink / 显存 | `dcgmi dmon` 旁路 | [`tool/dcgmi/README.md`](tool/dcgmi/README.md) |
+| **① DCGM 采集**（主力）| HBM / SM / PCIe / GPU 侧 NVLink / 显存 | `dcgmi dmon` 旁路，10 Hz 地板 | [`tool/dcgmi/README.md`](tool/dcgmi/README.md) |
 | **② nvswitch_traffic**（补 DCGM 空缺）| 过 NVSwitch 交换机的 NVLink 流量 | 直连 `libnvidia-nscq` | [`tool/nvswitch_traffic/README.md`](tool/nvswitch_traffic/README.md) |
+| **③ nsys**（要时间线/kernel 时）| 同 ① 的接口指标但 **10 kHz** + CPU 轨 + CUDA kernel 甘特图；配套三段流水线出 CSV/统计/图 | Nsight Systems，产 `.nsys-rep` | [`tool/nsys/README.md`](tool/nsys/README.md) |
 
-**一句话选路**：测 GPU 侧带宽 → 用 ①；测过交换机的流量 / 每 switch 端口热点 → 用 ②。两者可同时跑、共用同一时间窗。
+**一句话选路**：要**长时间序列 / CSV / 出图** → ①；要**过交换机的流量、每 switch 端口热点** → ②；
+要**微秒级时间线、哪个 kernel 在什么时候跑** → ③。
+①② 可同时跑、共用同一时间窗；**③ 与 ① 抢硬件计数器，不要对同一张卡同时开**（`docs/metrics_reference.md` §3.2）。
 
 `tool/` 目录结构（详见 `PLAN.md`「工具架构」）：
 ```
@@ -24,7 +27,10 @@ tool/
 ├── profile.sh  metrics.py  stamp.py          # 高层/共用脚本（DCGM 路径入口 + 解析·绘图 + 打戳）
 ├── workloads/                                 # 测试负载（gpu_busy.py 等"被测程序"替身）
 ├── dcgmi/                                     # ① DCGM 工具：README(快速上手) + 字段组 <name>.txt
-└── nvswitch_traffic/                          # ② NSCQ 工具：C 源码 + Makefile + README
+├── nvswitch_traffic/                          # ② NSCQ 工具：C 源码 + Makefile + README
+└── nsys/                                      # ③ Nsight Systems：nsys-tool 采集 + 后处理四步
+    #   post_export.py(导CSV) → post_plot.py overview(全局图)
+    #                        → dram_analyze.py(统计/周期) → post_plot.py detail(细节图)
 ```
 
 ---
@@ -55,7 +61,7 @@ tool/profile.sh --gpus 4,5 --fields pass1_core --interval-ms 1000 --duration 60
 python3 tool/metrics.py parse runs/<run_id>  # → metrics.csv + 控制台速览（宿主机, 纯 stdlib）
 docker run --rm --user "$(id -u):$(id -g)" -e MPLCONFIGDIR=/tmp/mpl \
   -v "$PWD":/work -w /work nvcr.io/nvidia/pytorch:25.12-py3 \
-  python tool/metrics.py plot runs/<run_id>  # → plots/trace.png（容器；--user 让图归当前用户）
+  python tool/metrics.py plot runs/<run_id>  # → trace.png（容器；--user 让图归当前用户）
 ```
 
 `profile.sh` 参数：
@@ -70,10 +76,11 @@ docker run --rm --user "$(id -u):$(id -g)" -e MPLCONFIGDIR=/tmp/mpl \
 | `--duration N` | attach 采 N 秒窗口 | 与 `-- <命令>`（wrap）二选一 |
 | `--lead N` / `--lag N` | wrap：命令前空采基线 / 命令后续采等流量回落 | `2` / `3` 秒（`--lag 0` 关）|
 | `--out DIR` | 输出根目录 | `runs/` |
+| `--note "一段话"` | 给这次采集写说明（分类用）| 写进 `runs/<id>/README.md` + 追加 `runs/README.md` 索引 + 存 `run_meta.json` |
 
 输出 `runs/<id>/`（dcgm 后端）：`dcgm_raw.log`(dmon 原样+每行 epoch) · `marks.txt`(关键时刻 epoch) · `workload.log` ·
-`metrics.csv`(长表 `epoch,t_rel,gpu,short,metric,value`) · `plots/trace.png` · `run_meta.json`。
-nvswitch 后端见下 ②。
+`metrics.csv`(长表 `epoch,t_rel,gpu,short,metric,value`) · `trace.png` · `run_meta.json` · `README.md`(单 run 说明，`--note` 写入)。
+`--note` 同时把一行追加进 `runs/README.md` 总索引（run→backend→note 表，方便之后扫一遍分类）。nvswitch 后端见下 ②。
 
 > `dcgmi dmon` 命令本身怎么用（`-e/-i/-d/-c` 参数、字段组文件、输出短名、warmup）→ **[`tool/dcgmi/README.md`](tool/dcgmi/README.md)**；
 > 字段语义/选字段/权限 → `docs/metrics_reference.md`。
@@ -89,15 +96,33 @@ cd tool/nvswitch_traffic && make             # 一次编译，产出 ./nvswitch_
 tool/profile.sh --backend nvswitch --sw-config sw_switch --interval-ms 100 -- <被测命令>
 # attach：只采一个窗口
 tool/profile.sh --backend nvswitch --sw-config sw_total --interval-ms 200 --duration 60
-# 解析 + 出图（parse 宿主机；plot 进容器，→ plots/nvswitch_trace.png）
+# 解析 + 出图（parse 宿主机；plot 进容器，→ nvswitch_trace.png）
 python3 tool/metrics.py parse runs/<run_id>
 docker run --rm --user "$(id -u):$(id -g)" -e MPLCONFIGDIR=/tmp/mpl \
   -v "$PWD":/work -w /work nvcr.io/nvidia/pytorch:25.12-py3 \
   python tool/metrics.py plot runs/<run_id>
 ```
 输出 `runs/<id>/`（nvswitch 后端）：`nvswitch.csv`(自带 epoch 的规范数据) · `nvswitch.err` · `marks.txt` ·
-`run_meta.json` · `plots/nvswitch_trace.png`。完整参数、配置组 `<name>.conf`、口径说明 →
+`run_meta.json` · `nvswitch_trace.png`。完整参数、配置组 `<name>.conf`、口径说明 →
 **[`tool/nvswitch_traffic/README.md`](tool/nvswitch_traffic/README.md)**。
+
+### ③ nsys（微秒级时间线 / kernel 甘特图）—— 入口 `tool/nsys/nsys-tool`
+不走 `profile.sh`（产物是二进制 `.nsys-rep` 而非逐行 CSV），但输出同样落 `runs/<id>/`、同样有 `marks.txt`/`run_meta.json`。
+```bash
+export PATH="$PWD/tool/nsys:$PATH"
+nsys-tool -i 6,7 -t 10                      # attach：不碰目标进程，采 10 秒 GPU 硬件轨（10 kHz）
+nsys-tool -g nvlink -i 6,7 -t 10            # 换 metric 组（分遍采：dram / nvlink / pcie / full …）
+nsys-tool -g cuda -i 6,7 -t 6 -y 8 -- python train.py     # wrap：拿 kernel 甘特图；采完主任务继续跑
+nsys-tool launch -g cuda -i 6,7 -- python server.py       # 三段式：app 起来先不采
+nsys-tool gen -t 5 --name decode-hi                       #   到点了才采 5 秒（报告最小）
+nsys-tool gen -t 5 --name decode-lo                       #   同一 session 可以再开窗口，各自一份报告
+nsys-tool shutdown                                        #   收尾（app 一起结束）
+```
+**关键边界**：GPU 硬件轨 / CPU 轨能对**已经在跑**的进程事后开采；
+**CUDA kernel 甘特图不能** —— 必须在进程启动时就套上 nsys（attach 配 CUDA 组会直接报错）。
+长任务（推理 server / 训练）别全程 trace：一次 `launch` + **在各阶段开几个 2–3 秒窗口**，
+每段一份报告 —— sglang 的现成编排见 [`tool/sglang_bench/`](tool/sglang_bench/README.md) 的 `profiler: nsys`。
+四类轨道的权限与 attach 能力对照表、metric 组、容器用法、坑速记 → **[`tool/nsys/README.md`](tool/nsys/README.md)**。
 
 ---
 

@@ -12,3 +12,12 @@ __pycache__/
 .vscode/
 
 experiments/*/logs/
+
+# tools
+tool/sglang_bench/analysis/
+tool/sglang_bench/experiments/
+
+tool/nsys/EXP*.md
+
+docs/claude_history/
+
