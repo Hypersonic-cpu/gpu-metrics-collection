@@ -41,3 +41,45 @@ MoE 路由与 accel-sim P0 runner 一致：每个 rank 使用 seed `42 + rank`�
 `torch.rand -> repeat -> multinomial(replacement=False)` 生成路由并 broadcast。所有 MoE case 的
 `top_k` 均固定为 8；scheduler 会在启动前检查官方 benchmark 中的 seed 语句，manifest validator
 也会拒绝其他 seed 或 TopK。
+
+## P0 buffer rotation
+
+16 个 P0 case 都使用仓库内独立的 rotation runner，ThunderKittens checkout 中的官方
+`benchmark.py` 保持不变。rotation 数量来自 `--rotation-config`；默认读取
+`~/Repos/ThunderKittens-RotationSize.json` 的 `cases.<TKID>.rotation_buffers`，YAML 不保存 N。
+每个 rank 使用显式 CUDA generator；copy 0 保持官方 seed/RNG 顺序，后续 copy 从同一 generator
+顺序产生，因此相同 N 与 seed 可复现；N=1 仍走同一个 rotation runner 的原始单-buffer 顺序。
+
+`warmup_rounds: 1` 表示正式计时前依次执行每一套 buffer 一次；measurement 使用
+`buffers[iteration % copies]`。validator 要求 native 全部 copy 数值校验通过、native/profile 首尾
+fingerprint 一致，并确认 Nsys/DCGM 数据有效。
+
+完整 P0（直接编辑脚本顶部 `P0_CASES=(...)` 可增删）：
+
+```bash
+scripts/run_tk_p0_rotation.sh
+```
+
+覆盖 rotation JSON：
+
+```bash
+scripts/run_tk_p0_rotation.sh --rotation-config /path/to/rotation.json
+```
+
+只运行这两个 case 的 native correctness + Nsys + DCGM：
+
+```bash
+scripts/run_tk002_tk026_rotation.sh
+```
+
+只运行 TK002：
+
+```bash
+scripts/run_tk002_rotation.sh
+```
+
+只运行 TK006：
+
+```bash
+scripts/run_tk006_rotation.sh
+```

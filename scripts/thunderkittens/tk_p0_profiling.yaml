@@ -9,7 +9,7 @@ profiling_defaults:
   nsys_gpus: "0"
   nsys_duration_s: 0.2
   nsys_frequency_hz: 100000
-  nsys_start_delay_s: 30
+  nsys_start_delay_s: 15
   dcgm_duration_s: 5
 moe_variant_root: scripts/thunderkittens/moe_variants
 moe_routing_seed_base: 42
@@ -33,6 +33,7 @@ groups:
       logical: {B: 8, S: 1, M: 8, N: 1536, K: 5120}
       execution: {M: 2048, N: 1536, K: 5120}
       runtime: {num_comm_sms: 8}
+      buffer_rotation: {seed_base: 0, warmup_rounds: 1}
       exactness: Exact GEMM shape; padded M
       source_compatible: true
     TK005:
@@ -51,6 +52,7 @@ groups:
       source_path: kernels/parallel/gemm_rs/gemm_rs_h100.cu
       logical: {B: 8, S: 1, M: 8, N: 5120, K: 1280}
       execution: {M: 1024, N: 5120, K: 1280}
+      buffer_rotation: {seed_base: 0, warmup_rounds: 1}
       exactness: Exact GEMM shape; padded M
       source_compatible: true
     TK006:
@@ -70,6 +72,7 @@ groups:
       logical: {B: 8, S: 1, M: 8, N: 6912, K: 5120}
       execution: {M: 2048, N: 6912, K: 5120}
       runtime: {num_comm_sms: 8}
+      buffer_rotation: {seed_base: 0, warmup_rounds: 1}
       exactness: Exact GEMM shape; padded M
       source_compatible: true
     TK007:
@@ -88,6 +91,7 @@ groups:
       source_path: kernels/parallel/gemm_rs/gemm_rs_h100.cu
       logical: {B: 8, S: 1, M: 8, N: 5120, K: 3456}
       execution: {M: 1024, N: 5120, K: 3584}
+      buffer_rotation: {seed_base: 0, warmup_rounds: 1}
       exactness: K padded to kernel stage alignment; M padded
       source_compatible: true
     TK022:
@@ -107,6 +111,7 @@ groups:
       logical: {B: 8, S: 1, M: 8, N: 640, K: 2048}
       execution: {M: 2048, N: 768, K: 2048}
       runtime: {num_comm_sms: 8}
+      buffer_rotation: {seed_base: 0, warmup_rounds: 1}
       exactness: N padded + M padded
       source_compatible: true
     TK025:
@@ -125,6 +130,7 @@ groups:
       source_path: kernels/parallel/gemm_rs/gemm_rs_h100.cu
       logical: {B: 8, S: 1, M: 8, N: 2048, K: 512}
       execution: {M: 1024, N: 2048, K: 512}
+      buffer_rotation: {seed_base: 0, warmup_rounds: 1}
       exactness: Exact GEMM shape; padded M
       source_compatible: true
     TK026:
@@ -144,6 +150,7 @@ groups:
       logical: {B: 8, S: 1, M: 8, N: 768, K: 2048, routed_per_expert: 0.5}
       execution: {B: 8, S: 1, M: 8, N: 768, K: 2048, H: 2048, I: 768, experts: 128, top_k: 8, routed_per_expert: 128}
       runtime: {num_comm_sms: 28}
+      buffer_rotation: {seed_base: 42, warmup_rounds: 1}
       exactness: Kernel de-hardcode; expert rows padded
       source_compatible: false
       source_requirement: Compile H=2048 I=768 TOP_K=8 NUM_EXPERTS=128 variant
@@ -164,6 +171,7 @@ groups:
       logical: {B: 8, S: 1024, M: 8192, N: 768, K: 2048, routed_per_expert: 512}
       execution: {B: 8, S: 1024, M: 8192, N: 768, K: 2048, H: 2048, I: 768, experts: 128, top_k: 8, routed_per_expert: 512}
       runtime: {num_comm_sms: 28}
+      buffer_rotation: {seed_base: 42, warmup_rounds: 1}
       exactness: Kernel de-hardcode
       source_compatible: false
       source_requirement: Compile H=2048 I=768 TOP_K=8 NUM_EXPERTS=128 variant
@@ -184,6 +192,7 @@ groups:
       logical: {B: 8, S: 1, M: 8, N: 1024, K: 4096}
       execution: {M: 2048, N: 1024, K: 4096}
       runtime: {num_comm_sms: 8}
+      buffer_rotation: {seed_base: 0, warmup_rounds: 1}
       exactness: Representative projection; M padded
       source_compatible: true
     TK042:
@@ -202,6 +211,7 @@ groups:
       source_path: kernels/parallel/gemm_rs/gemm_rs_h100.cu
       logical: {B: 8, S: 1, M: 8, N: 4096, K: 1024}
       execution: {M: 1024, N: 4096, K: 1024}
+      buffer_rotation: {seed_base: 0, warmup_rounds: 1}
       exactness: Representative projection; M padded
       source_compatible: true
     TK043:
@@ -221,6 +231,7 @@ groups:
       logical: {B: 8, S: 1, M: 8, N: 2048, K: 4096, routed_per_expert: 0.25}
       execution: {B: 8, S: 1, M: 8, N: 2048, K: 4096, H: 4096, I: 2048, experts: 256, top_k: 8, routed_per_expert: 128}
       runtime: {num_comm_sms: 28}
+      buffer_rotation: {seed_base: 42, warmup_rounds: 1}
       exactness: Kernel de-hardcode; expert rows padded
       source_compatible: false
       source_requirement: Compile H=4096 I=2048 TOP_K=8 NUM_EXPERTS=256 variant
@@ -241,6 +252,7 @@ groups:
       logical: {B: 8, S: 1024, M: 8192, N: 2048, K: 4096, routed_per_expert: 256}
       execution: {B: 8, S: 1024, M: 8192, N: 2048, K: 4096, H: 4096, I: 2048, experts: 256, top_k: 8, routed_per_expert: 256}
       runtime: {num_comm_sms: 28}
+      buffer_rotation: {seed_base: 42, warmup_rounds: 1}
       exactness: Kernel de-hardcode; expert rows padded
       source_compatible: false
       source_requirement: Compile H=4096 I=2048 TOP_K=8 NUM_EXPERTS=256 variant
@@ -261,6 +273,7 @@ groups:
       logical: {B: 8, S: 1, M: 8, N: 1152, K: 4096}
       execution: {M: 2048, N: 1280, K: 4096}
       runtime: {num_comm_sms: 8}
+      buffer_rotation: {seed_base: 0, warmup_rounds: 1}
       exactness: N padded + M padded
       source_compatible: true
     TK055:
@@ -279,6 +292,7 @@ groups:
       source_path: kernels/parallel/gemm_rs/gemm_rs_h100.cu
       logical: {B: 8, S: 1, M: 8, N: 4096, K: 1024}
       execution: {M: 1024, N: 4096, K: 1024}
+      buffer_rotation: {seed_base: 0, warmup_rounds: 1}
       exactness: Exact GEMM shape; padded M
       source_compatible: true
     TK056:
@@ -298,6 +312,7 @@ groups:
       logical: {B: 8, S: 1, M: 8, N: 1536, K: 4096, routed_per_expert: 0.5}
       execution: {B: 8, S: 1, M: 8, N: 1536, K: 4096, H: 4096, I: 1536, experts: 128, top_k: 8, routed_per_expert: 128}
       runtime: {num_comm_sms: 28}
+      buffer_rotation: {seed_base: 42, warmup_rounds: 1}
       exactness: Kernel de-hardcode; expert rows padded
       source_compatible: false
       source_requirement: Compile H=4096 I=1536 TOP_K=8 NUM_EXPERTS=128 variant
@@ -318,6 +333,7 @@ groups:
       logical: {B: 8, S: 1024, M: 8192, N: 1536, K: 4096, routed_per_expert: 512}
       execution: {B: 8, S: 1024, M: 8192, N: 1536, K: 4096, H: 4096, I: 1536, experts: 128, top_k: 8, routed_per_expert: 512}
       runtime: {num_comm_sms: 28}
+      buffer_rotation: {seed_base: 42, warmup_rounds: 1}
       exactness: Kernel de-hardcode
       source_compatible: false
       source_requirement: Compile H=4096 I=1536 TOP_K=8 NUM_EXPERTS=128 variant

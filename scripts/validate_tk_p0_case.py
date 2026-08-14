@@ -13,7 +13,8 @@ import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "thunderkittens"))
-from p0_manifest import load_manifest  # noqa: E402
+from p0_manifest import (DEFAULT_ROTATION_CONFIG, load_manifest,
+                         load_rotation_config)  # noqa: E402
 
 
 def run(command, env=None):
@@ -27,6 +28,8 @@ def main(argv=None):
     parser.add_argument("--group", default="p0")
     parser.add_argument("--case", required=True)
     parser.add_argument("--run", required=True, type=pathlib.Path)
+    parser.add_argument("--rotation-config", type=pathlib.Path,
+                        default=DEFAULT_ROTATION_CONFIG)
     parser.add_argument("--nsys-bin", default=os.environ.get(
         "NSYS_BIN", "/usr/local/cuda/bin/nsys"))
     args = parser.parse_args(argv)
@@ -53,6 +56,7 @@ def main(argv=None):
              nsys_dir, "--reuse-sqlite"])
 
         native_text = (args.run / "native/run.log").read_text(errors="replace")
+        workload_text = (args.run / "workload.log").read_text(errors="replace")
         timings = [float(value) for value in re.findall(r"TK: ([0-9.]+) ms", native_text)]
         if len(timings) != case["world_size"]:
             raise ValueError("native log has {} TK timings, expected {}".format(
@@ -83,6 +87,47 @@ def main(argv=None):
             (nsys_dir / "post_metrics.csv").open()))
         if post_rows == 0:
             raise ValueError("Nsys post_metrics.csv has no samples")
+        rotation_result = None
+        rotation = case.get("buffer_rotation")
+        if rotation:
+            _, rotation_sizes = load_rotation_config(
+                args.rotation_config, [args.case])
+            expected_copies = rotation_sizes[args.case]["copies"]
+            if "ROTATION_CORRECTNESS_PASS case={} copies={}".format(
+                    args.case, expected_copies) not in native_text:
+                raise ValueError("native rotation correctness did not pass")
+            allocation_pattern = re.compile(
+                r"ROTATION_ALLOC_DONE case={} copies=(\d+) .*?"
+                r"working_set_bytes_per_gpu=(\d+) .*?"
+                r"fingerprint_first=([0-9a-f]+) fingerprint_last=([0-9a-f]+)"
+                .format(re.escape(args.case)))
+            native_allocation = allocation_pattern.search(native_text)
+            workload_allocation = allocation_pattern.search(workload_text)
+            if not native_allocation or not workload_allocation:
+                raise ValueError("rotation allocation evidence is missing")
+            native_values = native_allocation.groups()
+            workload_values = workload_allocation.groups()
+            if native_values != workload_values:
+                raise ValueError("native/profile rotation fingerprints differ")
+            if int(native_values[0]) != expected_copies:
+                raise ValueError("rotation copy count differs from JSON")
+            if int(native_values[1]) <= 50 * 1024 ** 2:
+                raise ValueError("rotation working set does not exceed 50 MiB/GPU")
+            warmup_marker = "ROTATION_WARMUP_DONE case={} rounds=1 kernels={}".format(
+                args.case, expected_copies)
+            if warmup_marker not in workload_text:
+                raise ValueError("profile did not warm every rotating buffer")
+            if "ROTATION_MEASURE_BEGIN case={}".format(args.case) not in workload_text:
+                raise ValueError("profile measurement marker is missing")
+            rotation_result = {
+                "copies": int(native_values[0]),
+                "working_set_bytes_per_gpu": int(native_values[1]),
+                "fingerprint_first": native_values[2],
+                "fingerprint_last": native_values[3],
+                "warmup_rounds": rotation["warmup_rounds"],
+                "correctness": "PASS",
+                "reproducible_native_profile_fingerprints": True,
+            }
         result.update({
             "status": "PASS",
             "family": case["family"],
@@ -94,6 +139,7 @@ def main(argv=None):
             "nsys_metric_rows": post_rows,
             "dcgm_value_rows": len(dcgm_values),
             "dcgm_gpus": len(dcgm_gpus),
+            "buffer_rotation": rotation_result,
         })
     except Exception as error:
         result["error"] = str(error)

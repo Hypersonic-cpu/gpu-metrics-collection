@@ -13,7 +13,8 @@ import time
 REPO = pathlib.Path(__file__).resolve().parent.parent
 TK_DIR = REPO / "scripts/thunderkittens"
 sys.path.insert(0, str(TK_DIR))
-from p0_manifest import load_manifest, variant_name  # noqa: E402
+from p0_manifest import (DEFAULT_ROTATION_CONFIG, load_manifest,
+                         load_rotation_config, variant_name)  # noqa: E402
 
 
 def csv_gpu_ids(value):
@@ -53,6 +54,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Run official TK P0 native -> Nsys -> DCGM -> kill, then validate")
     parser.add_argument("--manifest", type=pathlib.Path, default=default_manifest)
+    parser.add_argument("--rotation-config", type=pathlib.Path,
+                        default=DEFAULT_ROTATION_CONFIG)
     parser.add_argument("--group", default="p0")
     parser.add_argument("--cases", help="comma-separated case IDs; default: all")
     parser.add_argument("--out", type=pathlib.Path)
@@ -92,6 +95,11 @@ def main(argv=None):
     unknown = [case_id for case_id in selected if case_id not in cases]
     if unknown:
         parser.error("unknown case(s): {}".format(",".join(unknown)))
+    try:
+        rotation_config, rotation_sizes = load_rotation_config(
+            args.rotation_config, selected)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        parser.error("invalid rotation config: {}".format(error))
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out_root = (args.out or REPO / "runs" / "tk_p0_official_{}".format(stamp)).resolve()
@@ -134,11 +142,17 @@ def main(argv=None):
               nsys_frequency, dcgm_duration), flush=True)
     for index, case_id in enumerate(selected, 1):
         case = cases[case_id]
+        rotation = case.get("buffer_rotation")
+        resolved_rotation = dict(rotation_sizes[case_id], **rotation)
         variant = (" variant=" + variant_name(case["execution"])
                    if case["family"] == "MoE" else "")
-        print("[PLAN {}/{}] {} family={} runner={} shape={}{}".format(
+        rotation_text = (" rotation={copies}x seed={seed_base} warmup_rounds="
+                         "{warmup_rounds} json_total_gib={total_gib}"
+                         .format(**resolved_rotation)
+                         if rotation else " rotation=off")
+        print("[PLAN {}/{}] {} family={} runner={} shape={}{}{}".format(
             index, len(selected), case_id, case["family"], case["runner"],
-            case["execution"], variant), flush=True)
+            case["execution"], variant, rotation_text), flush=True)
     if args.dry_run:
         print("[DRY RUN PASS] manifest and all official benchmark paths are valid; GPU untouched")
         return 0
@@ -146,10 +160,16 @@ def main(argv=None):
     out_root.mkdir(parents=True, exist_ok=True)
     (out_root / "suite_config.json").write_text(json.dumps({
         "manifest": str(args.manifest.resolve()), "cases": selected,
+        "rotation_config": str(rotation_config),
         "devices": devices, "nsys_gpus": nsys_gpus,
         "nsys_duration_s": nsys_duration,
         "nsys_frequency_hz": nsys_frequency,
         "nsys_delay_s": nsys_delay, "dcgm_duration_s": dcgm_duration,
+        "buffer_rotation": {
+            case_id: dict(rotation_sizes[case_id],
+                          **cases[case_id].get("buffer_rotation", {}))
+            for case_id in selected
+        },
     }, indent=2) + "\n")
     if not args.skip_moe_build:
         print("[BUILD] ensure three MoE variants under {}".format(variant_root), flush=True)
@@ -165,6 +185,7 @@ def main(argv=None):
     for index, case_id in enumerate(selected, 1):
         reap(active, results)
         case_out = out_root / case_id
+        rotation = cases[case_id]["buffer_rotation"]
         env = os.environ.copy()
         env.update({
             "GROUP": args.group, "DEVICES": devices, "NSYS_GPUS": nsys_gpus,
@@ -175,6 +196,10 @@ def main(argv=None):
             "NATIVE_ITERS": str(policy["native_iters"]),
             "PROFILE_ITERS": str(policy["profile_iters"]),
             "MOE_VARIANT_ROOT": str(variant_root),
+            "ROTATION_COPIES": str(rotation_sizes[case_id]["copies"]),
+            "ROTATION_SEED_BASE": str(rotation.get("seed_base", 0)),
+            "ROTATION_WARMUP_ROUNDS": str(
+                rotation.get("warmup_rounds", policy["warmup_iters"])),
         })
         print("[PROGRESS {}/{}][LAUNCH] {} family={} out={}".format(
             index, len(selected), case_id, cases[case_id]["family"], case_out),
@@ -199,6 +224,7 @@ def main(argv=None):
             sys.executable, REPO / "scripts/validate_tk_p0_case.py",
             "--manifest", args.manifest.resolve(), "--group", args.group,
             "--case", case_id, "--run", case_out,
+            "--rotation-config", rotation_config,
         ], stdout=handle, stderr=subprocess.STDOUT)
         handle.close()
         active.append((case_id, process, validation_log, case_out))
